@@ -1,0 +1,32 @@
+{
+  "name": "Larder — food & nutrition tracker",
+  "short_name": "Larder",
+  "description": "Low-FODMAP food log with AI-estimated nutrition, daily and weekly totals, and CSV export.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#f3ebdd",
+  "theme_color": "#f3ebdd",
+  "categories": ["health", "food", "productivity"],
+  "icons": [
+    {
+      "src": "icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icon-512-maskable.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}

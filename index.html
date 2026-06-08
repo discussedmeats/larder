@@ -1,0 +1,1397 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#f3ebdd" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="Larder" />
+  <meta name="description" content="Low-FODMAP food log with AI-estimated nutrition, daily and weekly totals, and CSV export." />
+  <link rel="manifest" href="./manifest.json" />
+  <link rel="apple-touch-icon" href="./icon-192.png" />
+  <link rel="icon" type="image/png" href="./icon-192.png" />
+  <title>Larder · food &amp; nutrition tracker</title>
+  <style>
+    html, body { margin: 0; padding: 0; background: #f3ebdd; -webkit-font-smoothing: antialiased; }
+    body { overscroll-behavior-y: none; }
+    #root { min-height: 100vh; min-height: 100dvh; }
+    .boot { font-family: system-ui, sans-serif; color: #8c8073; font-size: 14px; text-align: center; padding: 40vh 0 0; }
+  </style>
+</head>
+<body>
+  <div id="root"><div class="boot">Loading Larder…</div></div>
+
+  <script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+  <script>
+    if ("serviceWorker" in navigator && location.protocol !== "file:") {
+      window.addEventListener("load", () => {
+        navigator.serviceWorker.register("./sw.js").catch(() => {});
+      });
+    }
+  </script>
+
+  <script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo, useCallback } = React;
+
+/* ============================================================
+   Larder — standalone PWA build.
+   - localStorage for persistence (replaces Claude's window.storage)
+   - Anthropic API called directly with the user's own key
+   - Model: Claude Haiku 4.5 (cheapest current-gen)
+   ============================================================ */
+
+const MODEL = "claude-haiku-4-5-20251001";
+const STORE = "larder-entries-v1";
+const FODMAP_STORE = "larder-fodmap-v1";
+const KEY_STORE = "larder-api-key";
+const SYNC_URL_STORE = "larder-sync-url";
+const PENDING_STORE = "larder-pending";
+const LAST_SYNC_STORE = "larder-last-sync";
+
+const pad = (n) => String(n).padStart(2, "0");
+
+const NUTRIENTS = [
+  { key: "totalFat", col: "Total Fat", label: "Total Fat", unit: "g" },
+  { key: "saturatedFat", col: "Saturated Fat", label: "Sat. Fat", unit: "g" },
+  { key: "sodium", col: "Sodium", label: "Sodium", unit: "mg" },
+  { key: "carbohydrates", col: "Carbohydrates", label: "Carbs", unit: "g" },
+  { key: "sugars", col: "Sugars", label: "Sugars", unit: "g" },
+  { key: "addedSugars", col: "Added Sugars", label: "Added Sugars", unit: "g" },
+  { key: "fiber", col: "Fiber", label: "Fiber", unit: "g" },
+  { key: "protein", col: "Protein", label: "Protein", unit: "g" },
+  { key: "calories", col: "Calories", label: "Calories", unit: "kcal" },
+];
+
+const COLUMNS = [
+  "Food name", "Portion Size", "Total Fat", "Saturated Fat", "Sodium",
+  "Carbohydrates", "Sugars", "Added Sugars", "Fiber", "Protein",
+  "Calories", "Date", "Time",
+];
+
+/* ---------- date helpers (device local time) ---------- */
+const todayStr = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+};
+const nowTime = () => {
+  const d = new Date();
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+};
+const mondayOf = (dateStr) => {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  const dt = new Date(y, m - 1, d);
+  const offset = (dt.getDay() + 6) % 7;
+  dt.setDate(dt.getDate() - offset);
+  return `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())}`;
+};
+const addDays = (dateStr, n) => {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  const dt = new Date(y, m - 1, d);
+  dt.setDate(dt.getDate() + n);
+  return `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())}`;
+};
+const fmtDay = (dateStr) => {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  return new Date(y, m - 1, d).toLocaleDateString("en-US", {
+    weekday: "short", month: "short", day: "numeric",
+  });
+};
+const fmtRange = (mon) => {
+  const sun = addDays(mon, 6);
+  const [, m1, d1] = mon.split("-");
+  const [y2, m2, d2] = sun.split("-");
+  const M = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  return `${M[+m1]} ${+d1} – ${M[+m2]} ${+d2}, ${y2}`;
+};
+
+/* ---------- storage helpers (sync localStorage) ---------- */
+const loadJSON = (k, fb) => {
+  try { const v = localStorage.getItem(k); return v != null ? JSON.parse(v) : fb; }
+  catch { return fb; }
+};
+const saveJSON = (k, v) => {
+  try { localStorage.setItem(k, JSON.stringify(v)); }
+  catch (e) { console.error("localStorage save failed", e); }
+};
+const loadApiKey = () => localStorage.getItem(KEY_STORE) || "";
+const saveApiKey = (k) => {
+  if (k) localStorage.setItem(KEY_STORE, k);
+  else localStorage.removeItem(KEY_STORE);
+};
+const loadSyncUrl = () => localStorage.getItem(SYNC_URL_STORE) || "";
+const saveSyncUrl = (u) => {
+  if (u) localStorage.setItem(SYNC_URL_STORE, u);
+  else localStorage.removeItem(SYNC_URL_STORE);
+};
+
+/* ---------- LLM helpers ---------- */
+function extractJSON(data) {
+  const text = (data.content || [])
+    .filter((b) => b.type === "text")
+    .map((b) => b.text)
+    .join("");
+  const clean = text.replace(/```json/gi, "").replace(/```/g, "").trim();
+  const s = clean.indexOf("{");
+  const e = clean.lastIndexOf("}");
+  if (s === -1 || e === -1) throw new Error("no JSON in response");
+  return JSON.parse(clean.slice(s, e + 1));
+}
+
+async function callClaude(prompt, apiKey) {
+  if (!apiKey) { const e = new Error("no key"); e.code = "NO_KEY"; throw e; }
+  let res;
+  try {
+    res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+        "anthropic-dangerous-direct-browser-access": "true",
+      },
+      body: JSON.stringify({
+        model: MODEL,
+        max_tokens: 1000,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+  } catch (e) {
+    const err = new Error("network"); err.code = "NETWORK"; throw err;
+  }
+  if (!res.ok) {
+    const err = new Error("api " + res.status);
+    err.code = res.status === 401 || res.status === 403 ? "BAD_KEY" : "API_ERROR";
+    err.status = res.status;
+    throw err;
+  }
+  return res.json();
+}
+
+async function lookupNutrition(food, portion, apiKey) {
+  const prompt =
+`You are a nutrition estimation tool. Estimate nutrition facts for the food and portion below.
+Food: ${food}
+Portion: ${portion || "1 standard serving"}
+
+Respond with ONLY a JSON object — no markdown, no commentary. All values are numbers (no units, no strings):
+{"estimatedGrams": 0, "totalFat": 0, "saturatedFat": 0, "sodium": 0, "carbohydrates": 0, "sugars": 0, "addedSugars": 0, "fiber": 0, "protein": 0, "calories": 0}
+
+"estimatedGrams" = the typical total weight of this portion in grams, using average real-world sizes (e.g. 1 large egg ≈ 50 g, 1 medium banana ≈ 118 g, 1 slice of bread ≈ 38 g, 1 cup cooked rice ≈ 158 g). If the portion is already given as a weight, use that number.
+Units: totalFat/saturatedFat/carbohydrates/sugars/addedSugars/fiber/protein in grams; sodium in milligrams; calories in kcal.
+"addedSugars" = refined/added sugar only — use 0 for whole, unprocessed foods (plain fruit, plain meat, plain vegetables).
+Round every value to one decimal place.`;
+  const data = await callClaude(prompt, apiKey);
+  const j = extractJSON(data);
+  const out = { grams: Math.round(Number(j.estimatedGrams) || 0) };
+  for (const n of NUTRIENTS) out[n.key] = Number(j[n.key]) || 0;
+  return out;
+}
+
+async function fodmapReview(foodList, apiKey) {
+  const prompt =
+`A person is tracking food for a low-FODMAP diet (commonly used to manage IBS symptoms). Here are the foods eaten over one week:
+${foodList.map((f) => "- " + f).join("\n")}
+
+Using standard low-FODMAP references (e.g. Monash University guidance), respond with ONLY a JSON object — no markdown:
+{
+ "alignment": "2-3 sentence overall assessment of how well this week fits a low-FODMAP diet",
+ "highFodmap": ["food — short reason it is high-FODMAP", "..."],
+ "lowFodmapGood": ["low-FODMAP-friendly choices already present", "..."],
+ "completeness": ["specific, actionable suggestions to improve nutritional completeness using low-FODMAP foods", "..."]
+}
+Keep highFodmap, lowFodmapGood and completeness to 3-5 concise items each. This is general educational information, not medical advice.`;
+  const data = await callClaude(prompt, apiKey);
+  return extractJSON(data);
+}
+
+/* ---------- Google Sheets sync ---------- */
+async function gsGet(url) {
+  const res = await fetch(url, { method: "GET", redirect: "follow" });
+  if (!res.ok) throw new Error("Sheet GET failed (" + res.status + ")");
+  const data = await res.json();
+  if (data.error) throw new Error(data.error);
+  return data;
+}
+
+async function gsPost(url, body) {
+  // text/plain avoids the CORS preflight that Apps Script can't answer.
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain;charset=utf-8" },
+    body: JSON.stringify(body),
+    redirect: "follow",
+  });
+  if (!res.ok) throw new Error("Sheet POST failed (" + res.status + ")");
+  const data = await res.json();
+  if (data.error) throw new Error(data.error);
+  return data;
+}
+
+function normalizeEntry(e) {
+  const out = {
+    id: String(e.id || ""),
+    foodName: String(e.foodName || ""),
+    portionSize: String(e.portionSize || ""),
+    grams: Number(e.grams) || 0,
+    date: String(e.date || ""),
+    time: String(e.time || ""),
+    updatedAt: Number(e.updatedAt) || 0,
+  };
+  for (const n of NUTRIENTS) out[n.key] = Number(e[n.key]) || 0;
+  return out;
+}
+
+function pushOp(op) {
+  const cur = loadJSON(PENDING_STORE, []);
+  let next;
+  if (op.type === "delete") {
+    // A later delete supersedes any pending upsert for the same id
+    next = cur.filter((p) => !(p.type === "upsert" && p.entry.id === op.id));
+  } else if (op.type === "upsert") {
+    // Coalesce repeated upserts of the same id
+    next = cur.filter((p) => !(p.type === "upsert" && p.entry.id === op.entry.id));
+  } else {
+    next = [...cur];
+  }
+  next.push(op);
+  saveJSON(PENDING_STORE, next);
+}
+
+// Module-level guard so concurrent triggers don't fight each other
+let __syncInFlight = false;
+
+async function performSync(url) {
+  if (!url) throw new Error("no sync URL");
+  if (__syncInFlight) return { skipped: true };
+  __syncInFlight = true;
+  try {
+    // 1. Drain pending. Re-read between ops in case the user adds more during sync.
+    while (true) {
+      const cur = loadJSON(PENDING_STORE, []);
+      if (cur.length === 0) break;
+      const op = cur[0];
+      if (op.type === "upsert") {
+        await gsPost(url, { action: "upsert", entry: op.entry });
+      } else if (op.type === "delete") {
+        await gsPost(url, { action: "delete", id: op.id });
+      }
+      const after = loadJSON(PENDING_STORE, []);
+      saveJSON(PENDING_STORE, after.slice(1));
+    }
+    // 2. Pull from sheet — sheet is the source of truth
+    const { entries: remote } = await gsGet(url);
+    const normalized = (remote || []).map(normalizeEntry);
+    saveJSON(STORE, normalized);
+    saveJSON(LAST_SYNC_STORE, Date.now());
+    return { entries: normalized };
+  } finally {
+    __syncInFlight = false;
+  }
+}
+
+/* ---------- totals & grouping ---------- */
+const portionLabel = (e) =>
+  e.grams
+    ? `${e.portionSize ? e.portionSize + " " : ""}(≈${e.grams} g)`
+    : e.portionSize;
+
+function sumEntries(entries) {
+  const t = { grams: 0 };
+  for (const n of NUTRIENTS) t[n.key] = 0;
+  for (const e of entries) {
+    t.grams += Number(e.grams) || 0;
+    for (const n of NUTRIENTS) t[n.key] += Number(e[n.key]) || 0;
+  }
+  for (const n of NUTRIENTS) t[n.key] = Math.round(t[n.key] * 10) / 10;
+  t.grams = Math.round(t.grams * 10) / 10;
+  return t;
+}
+
+function groupByWeek(entries) {
+  const weeks = {};
+  for (const e of entries) {
+    const mon = mondayOf(e.date);
+    (weeks[mon] = weeks[mon] || []).push(e);
+  }
+  return Object.keys(weeks).sort().reverse().map((monday) => {
+    const wkEntries = weeks[monday];
+    const dayMap = {};
+    for (const e of wkEntries) (dayMap[e.date] = dayMap[e.date] || []).push(e);
+    const days = Object.keys(dayMap).sort().reverse().map((date) => {
+      const dayEntries = dayMap[date].sort((a, b) =>
+        (a.time || "").localeCompare(b.time || "")
+      );
+      return { date, entries: dayEntries, totals: sumEntries(dayEntries) };
+    });
+    return { monday, days, totals: sumEntries(wkEntries) };
+  });
+}
+
+/* ---------- CSV ---------- */
+const csvCell = (v) => {
+  const s = String(v ?? "");
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+};
+function buildCSV(entries) {
+  const rows = [COLUMNS];
+  for (const wk of groupByWeek(entries)) {
+    for (const day of wk.days) {
+      for (const e of day.entries) {
+        rows.push([
+          e.foodName, portionLabel(e), e.totalFat, e.saturatedFat, e.sodium,
+          e.carbohydrates, e.sugars, e.addedSugars, e.fiber, e.protein,
+          e.calories, e.date, e.time,
+        ]);
+      }
+      const dt = day.totals;
+      rows.push([
+        `DAILY TOTAL — ${day.date}`, `${dt.grams} g`, dt.totalFat, dt.saturatedFat,
+        dt.sodium, dt.carbohydrates, dt.sugars, dt.addedSugars, dt.fiber,
+        dt.protein, dt.calories, day.date, "",
+      ]);
+    }
+    const wt = wk.totals;
+    rows.push([
+      `WEEKLY TOTAL — ${wk.monday} to ${addDays(wk.monday, 6)}`, `${wt.grams} g`,
+      wt.totalFat, wt.saturatedFat, wt.sodium, wt.carbohydrates, wt.sugars,
+      wt.addedSugars, wt.fiber, wt.protein, wt.calories, "", "",
+    ]);
+    rows.push([]);
+  }
+  return rows.map((r) => r.map(csvCell).join(",")).join("\n");
+}
+
+/* ============================================================
+   STYLES
+   ============================================================ */
+const C = {
+  paper: "#f3ebdd", surface: "#fffdf7", ink: "#2c2620", muted: "#8c8073",
+  faint: "#b6ab9b", border: "#e2d6c2", clay: "#bd5230", clayDark: "#9a3f23",
+  sage: "#5f7150", sageBg: "#e8ead9", clayBg: "#f6e2d8",
+};
+
+const css = `
+@import url('https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;1,9..144,500&family=Hanken+Grotesk:wght@400;500;600;700&family=Spline+Sans+Mono:wght@400;500;600&display=swap');
+.lardr * { box-sizing: border-box; }
+.lardr ::placeholder { color: ${C.faint}; }
+.lardr input, .lardr select, .lardr textarea { font-family: 'Hanken Grotesk', sans-serif; }
+.lardr input:focus, .lardr select:focus, .lardr textarea:focus { outline: 2px solid ${C.clay}; outline-offset: 1px; }
+@keyframes lardr-spin { to { transform: rotate(360deg); } }
+@keyframes lardr-rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+.lardr-btn { transition: transform .12s ease, filter .12s ease; }
+.lardr-btn:active:not(:disabled) { transform: scale(.97); }
+.lardr-btn:hover:not(:disabled) { filter: brightness(1.06); }
+.lardr-row { animation: lardr-rise .25s ease both; }
+`;
+
+const S = {
+  shell: {
+    fontFamily: "'Hanken Grotesk', sans-serif",
+    background: `radial-gradient(120% 60% at 100% 0%, #f7f0e3 0%, ${C.paper} 55%)`,
+    minHeight: "100vh", color: C.ink, padding: "0 0 64px",
+  },
+  wrap: { maxWidth: 520, margin: "0 auto", padding: "0 16px" },
+  header: { padding: "26px 0 14px", textAlign: "center" },
+  brand: {
+    fontFamily: "'Fraunces', serif", fontSize: 38, fontWeight: 600,
+    letterSpacing: "-0.5px", lineHeight: 1, margin: 0,
+  },
+  brandDot: { color: C.clay },
+  tagline: {
+    fontSize: 12.5, color: C.muted, marginTop: 6, letterSpacing: "0.04em",
+    textTransform: "uppercase",
+  },
+  tabs: {
+    display: "flex", gap: 4, background: C.surface, border: `1px solid ${C.border}`,
+    borderRadius: 999, padding: 4, margin: "16px 0 18px",
+  },
+  tab: (active) => ({
+    flex: 1, padding: "9px 8px", borderRadius: 999, border: "none",
+    cursor: "pointer", fontFamily: "'Hanken Grotesk', sans-serif",
+    fontSize: 13.5, fontWeight: 600,
+    background: active ? C.ink : "transparent",
+    color: active ? C.paper : C.muted,
+  }),
+  card: {
+    background: C.surface, border: `1px solid ${C.border}`, borderRadius: 16,
+    padding: 16, marginBottom: 14,
+    boxShadow: "0 1px 0 rgba(0,0,0,0.02), 0 8px 24px -18px rgba(60,40,20,0.4)",
+  },
+  label: {
+    fontSize: 11, fontWeight: 700, letterSpacing: "0.07em",
+    textTransform: "uppercase", color: C.muted, marginBottom: 5, display: "block",
+  },
+  input: {
+    width: "100%", padding: "10px 12px", borderRadius: 10,
+    border: `1px solid ${C.border}`, background: "#fff", fontSize: 15,
+    color: C.ink,
+  },
+  numInput: {
+    width: "100%", padding: "7px 8px", borderRadius: 8,
+    border: `1px solid ${C.border}`, background: "#fff", fontSize: 14,
+    color: C.ink, fontFamily: "'Spline Sans Mono', monospace",
+  },
+  primaryBtn: {
+    width: "100%", padding: "12px", borderRadius: 11, border: "none",
+    background: C.clay, color: "#fff", fontWeight: 700, fontSize: 14.5,
+    cursor: "pointer", fontFamily: "'Hanken Grotesk', sans-serif",
+  },
+  ghostBtn: {
+    width: "100%", padding: "11px", borderRadius: 11,
+    border: `1.5px solid ${C.ink}`, background: "transparent", color: C.ink,
+    fontWeight: 600, fontSize: 14, cursor: "pointer",
+    fontFamily: "'Hanken Grotesk', sans-serif",
+  },
+  dangerBtn: {
+    width: "100%", padding: "11px", borderRadius: 11,
+    border: `1.5px solid ${C.clayDark}`, background: "transparent", color: C.clayDark,
+    fontWeight: 600, fontSize: 14, cursor: "pointer",
+    fontFamily: "'Hanken Grotesk', sans-serif",
+  },
+  mono: { fontFamily: "'Spline Sans Mono', monospace" },
+};
+
+/* ============================================================
+   SMALL COMPONENTS
+   ============================================================ */
+function TotalsGrid({ totals, accent }) {
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 8 }}>
+      {NUTRIENTS.map((n) => (
+        <div
+          key={n.key}
+          style={{
+            background: accent === "sage" ? C.sageBg : C.clayBg,
+            borderRadius: 9, padding: "8px 9px",
+          }}
+        >
+          <div style={{ fontSize: 9.5, fontWeight: 700, letterSpacing: "0.05em",
+            textTransform: "uppercase", color: C.muted }}>
+            {n.label}
+          </div>
+          <div style={{ ...S.mono, fontSize: 15, fontWeight: 600, marginTop: 2 }}>
+            {totals[n.key]}
+            <span style={{ fontSize: 9.5, color: C.muted, marginLeft: 2 }}>{n.unit}</span>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function EntryRow({ e, onDelete }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="lardr-row" style={{ borderTop: `1px solid ${C.border}`, padding: "10px 0" }}>
+      <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+        <button
+          onClick={() => setOpen((o) => !o)}
+          style={{ flex: 1, textAlign: "left", background: "none", border: "none",
+            cursor: "pointer", padding: 0, fontFamily: "'Hanken Grotesk', sans-serif" }}
+        >
+          <div style={{ fontWeight: 600, fontSize: 15, color: C.ink }}>{e.foodName}</div>
+          <div style={{ fontSize: 12.5, color: C.muted, marginTop: 1 }}>
+            {portionLabel(e) || "—"} · {e.time}
+          </div>
+        </button>
+        <div style={{ ...S.mono, fontWeight: 600, fontSize: 14, color: C.clay }}>
+          {e.calories}<span style={{ fontSize: 9.5, color: C.muted }}> kcal</span>
+        </div>
+        <button
+          onClick={() => onDelete(e.id)}
+          aria-label="delete"
+          style={{ border: "none", background: "none", cursor: "pointer",
+            color: C.faint, fontSize: 17, padding: "0 2px", lineHeight: 1 }}
+        >
+          ×
+        </button>
+      </div>
+      {open && (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)",
+          gap: 6, marginTop: 9 }}>
+          {NUTRIENTS.filter((n) => n.key !== "calories").map((n) => (
+            <div key={n.key} style={{ fontSize: 11, color: C.muted }}>
+              {n.label}{" "}
+              <span style={{ ...S.mono, color: C.ink, fontWeight: 600 }}>
+                {e[n.key]}{n.unit}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function apiErrorMessage(err) {
+  if (!err || !err.code) return "Lookup failed — try again, or enter values manually.";
+  if (err.code === "NO_KEY") return "Add your Anthropic API key in Settings to enable lookup.";
+  if (err.code === "BAD_KEY") return "API key was rejected — check it in Settings.";
+  if (err.code === "NETWORK") return "Couldn't reach Anthropic — check your connection.";
+  return "Lookup failed — try again, or enter values manually.";
+}
+
+/* ============================================================
+   LOG TAB
+   ============================================================ */
+function LogTab({ entries, apiKey, addEntry, deleteEntry, goSettings }) {
+  const blank = NUTRIENTS.reduce((o, n) => ((o[n.key] = ""), o), {});
+  const [food, setFood] = useState("");
+  const [portion, setPortion] = useState("");
+  const [grams, setGrams] = useState("");
+  const [date, setDate] = useState(todayStr());
+  const [time, setTime] = useState(nowTime());
+  const [vals, setVals] = useState(blank);
+  const [looking, setLooking] = useState(false);
+  const [err, setErr] = useState("");
+  const [filled, setFilled] = useState(false);
+
+  const today = todayStr();
+  const todays = entries
+    .filter((e) => e.date === today)
+    .sort((a, b) => (a.time || "").localeCompare(b.time || ""));
+  const todayTotals = useMemo(() => sumEntries(todays), [todays]);
+
+  const doLookup = async () => {
+    if (!food.trim()) { setErr("Enter a food name first."); return; }
+    setErr(""); setLooking(true);
+    try {
+      const r = await lookupNutrition(food.trim(), portion.trim(), apiKey);
+      setVals(r);
+      setGrams(r.grams ? String(r.grams) : "");
+      setFilled(true);
+    } catch (e) {
+      setErr(apiErrorMessage(e));
+    } finally {
+      setLooking(false);
+    }
+  };
+
+  const save = () => {
+    if (!food.trim()) { setErr("Enter a food name first."); return; }
+    const entry = {
+      id: Date.now() + "-" + Math.random().toString(36).slice(2, 7),
+      foodName: food.trim(),
+      portionSize: portion.trim(),
+      grams: Number(grams) || 0,
+      date, time,
+    };
+    for (const n of NUTRIENTS) entry[n.key] = Number(vals[n.key]) || 0;
+    addEntry(entry);
+    setFood(""); setPortion(""); setGrams(""); setVals(blank); setFilled(false);
+    setErr(""); setDate(todayStr()); setTime(nowTime());
+  };
+
+  const needsKey = !apiKey;
+
+  return (
+    <div>
+      {needsKey && (
+        <div
+          style={{ ...S.card, background: C.clayBg, borderColor: "#e9c3b1",
+            display: "flex", alignItems: "center", justifyContent: "space-between",
+            gap: 10 }}
+        >
+          <div style={{ fontSize: 13, color: C.clayDark }}>
+            Add your Anthropic API key to enable nutrition lookup.
+          </div>
+          <button
+            onClick={goSettings}
+            style={{ ...S.primaryBtn, width: "auto", padding: "8px 14px",
+              fontSize: 13 }}
+          >
+            Open Settings
+          </button>
+        </div>
+      )}
+
+      <div style={S.card}>
+        <div style={{ marginBottom: 11 }}>
+          <label style={S.label}>Food name</label>
+          <input
+            style={S.input} value={food} placeholder="e.g. scrambled eggs on sourdough"
+            onChange={(e) => setFood(e.target.value)}
+          />
+        </div>
+        <div style={{ display: "flex", gap: 9, marginBottom: 6 }}>
+          <div style={{ flex: 1.5 }}>
+            <label style={S.label}>Portion size</label>
+            <input
+              style={S.input} value={portion} placeholder="e.g. 2 eggs, 1 slice"
+              onChange={(e) => setPortion(e.target.value)}
+            />
+          </div>
+          <div style={{ flex: 1 }}>
+            <label style={S.label}>Weight (g)</label>
+            <input
+              style={S.input} inputMode="decimal" value={grams}
+              placeholder={filled ? "" : "auto"}
+              onChange={(e) => setGrams(e.target.value)}
+            />
+          </div>
+        </div>
+        <div style={{ fontSize: 10.5, color: C.faint, marginBottom: 12,
+          lineHeight: 1.45 }}>
+          Leave Weight blank — “Look up nutrition” fills it with an average size
+          (1 egg ≈ 50 g). Adjust it for your actual portion; totals add up these grams.
+        </div>
+
+        <button
+          className="lardr-btn"
+          style={{ ...S.ghostBtn, marginBottom: 12, opacity: looking ? 0.7 : 1 }}
+          disabled={looking}
+          onClick={doLookup}
+        >
+          {looking ? "Estimating nutrition…" : "↗  Look up nutrition"}
+        </button>
+
+        <label style={S.label}>
+          Nutrition facts {filled ? "(estimate — edit if needed)" : "(or enter manually)"}
+        </label>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)",
+          gap: 8, marginBottom: 12 }}>
+          {NUTRIENTS.map((n) => (
+            <div key={n.key}>
+              <div style={{ fontSize: 10, color: C.muted, marginBottom: 3 }}>
+                {n.label} ({n.unit})
+              </div>
+              <input
+                style={S.numInput} inputMode="decimal" value={vals[n.key]}
+                placeholder="0"
+                onChange={(e) =>
+                  setVals((v) => ({ ...v, [n.key]: e.target.value }))
+                }
+              />
+            </div>
+          ))}
+        </div>
+
+        <div style={{ display: "flex", gap: 9, marginBottom: 13 }}>
+          <div style={{ flex: 1 }}>
+            <label style={S.label}>Date</label>
+            <input type="date" style={S.input} value={date}
+              onChange={(e) => setDate(e.target.value)} />
+          </div>
+          <div style={{ flex: 1 }}>
+            <label style={S.label}>Time</label>
+            <input type="time" style={S.input} value={time}
+              onChange={(e) => setTime(e.target.value)} />
+          </div>
+        </div>
+
+        {err && (
+          <div style={{ fontSize: 12.5, color: C.clayDark, marginBottom: 10 }}>{err}</div>
+        )}
+        <button className="lardr-btn" style={S.primaryBtn} onClick={save}>
+          Add to log
+        </button>
+      </div>
+
+      <div style={S.card}>
+        <div style={{ display: "flex", justifyContent: "space-between",
+          alignItems: "baseline", marginBottom: 4 }}>
+          <h3 style={{ fontFamily: "'Fraunces', serif", fontSize: 19, margin: 0,
+            fontWeight: 600 }}>
+            Today
+          </h3>
+          <span style={{ fontSize: 12, color: C.muted }}>{fmtDay(today)}</span>
+        </div>
+        {todays.length === 0 ? (
+          <p style={{ fontSize: 13.5, color: C.muted, margin: "8px 0 2px" }}>
+            Nothing logged yet today.
+          </p>
+        ) : (
+          <>
+            <div style={{ marginBottom: 12 }}>
+              {todays.map((e) => (
+                <EntryRow key={e.id} e={e} onDelete={deleteEntry} />
+              ))}
+            </div>
+            <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: "0.06em",
+              textTransform: "uppercase", color: C.sage, marginBottom: 7 }}>
+              Daily total · {todays.length} item{todays.length > 1 ? "s" : ""}
+              {todayTotals.grams > 0 ? ` · ≈ ${todayTotals.grams} g` : ""}
+            </div>
+            <TotalsGrid totals={todayTotals} accent="sage" />
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   HISTORY TAB
+   ============================================================ */
+function FodmapBlock({ week, reviews, setReview, apiKey, goSettings }) {
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState("");
+  const review = reviews[week.monday];
+
+  const run = async () => {
+    setErr(""); setLoading(true);
+    try {
+      const foods = week.days.flatMap((d) =>
+        d.entries.map((e) => `${e.foodName}${e.portionSize ? ` (${e.portionSize})` : ""}`)
+      );
+      const r = await fodmapReview(foods, apiKey);
+      setReview(week.monday, r);
+    } catch (e) {
+      setErr(apiErrorMessage(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div style={{ marginTop: 12, borderTop: `1px dashed ${C.border}`, paddingTop: 12 }}>
+      <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: "0.06em",
+        textTransform: "uppercase", color: C.clay, marginBottom: 8 }}>
+        Low-FODMAP review
+      </div>
+      {!review && (
+        <button
+          className="lardr-btn"
+          style={{ ...S.ghostBtn, opacity: loading ? 0.7 : 1 }}
+          disabled={loading || !apiKey}
+          onClick={apiKey ? run : goSettings}
+        >
+          {loading ? "Reviewing the week…" : apiKey ? "Generate low-FODMAP review" : "Set API key in Settings to enable"}
+        </button>
+      )}
+      {err && <div style={{ fontSize: 12.5, color: C.clayDark, marginTop: 8 }}>{err}</div>}
+      {review && (
+        <div style={{ fontSize: 13.5, lineHeight: 1.5 }}>
+          <p style={{ margin: "0 0 10px" }}>{review.alignment}</p>
+          {[
+            { t: "Higher-FODMAP items to watch", d: review.highFodmap, c: C.clayDark },
+            { t: "Good low-FODMAP choices", d: review.lowFodmapGood, c: C.sage },
+            { t: "For more complete nutrition", d: review.completeness, c: C.ink },
+          ].map(
+            (sec) =>
+              Array.isArray(sec.d) &&
+              sec.d.length > 0 && (
+                <div key={sec.t} style={{ marginBottom: 9 }}>
+                  <div style={{ fontWeight: 700, fontSize: 12, color: sec.c, marginBottom: 3 }}>
+                    {sec.t}
+                  </div>
+                  <ul style={{ margin: 0, paddingLeft: 17 }}>
+                    {sec.d.map((x, i) => (
+                      <li key={i} style={{ marginBottom: 2 }}>{x}</li>
+                    ))}
+                  </ul>
+                </div>
+              )
+          )}
+          <button
+            onClick={run}
+            disabled={loading || !apiKey}
+            style={{ background: "none", border: "none", color: C.muted,
+              fontSize: 11.5, cursor: "pointer", padding: 0,
+              textDecoration: "underline", fontFamily: "'Hanken Grotesk', sans-serif" }}
+          >
+            {loading ? "refreshing…" : "refresh review"}
+          </button>
+          <p style={{ fontSize: 10.5, color: C.faint, marginTop: 8, marginBottom: 0 }}>
+            General educational information, not medical advice. The Monash University
+            FODMAP app is the most accurate reference for specific foods.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function HistoryTab({ entries, reviews, setReview, apiKey, goSettings, deleteEntry }) {
+  const weeks = useMemo(() => groupByWeek(entries), [entries]);
+  const [openDays, setOpenDays] = useState(() => {
+    const ws = groupByWeek(entries);
+    if (ws.length && ws[0].days.length) return { [ws[0].days[0].date]: true };
+    return {};
+  });
+  const toggleDay = (d) =>
+    setOpenDays((o) => ({ ...o, [d]: !o[d] }));
+  if (entries.length === 0) {
+    return (
+      <div style={S.card}>
+        <p style={{ fontSize: 14, color: C.muted, margin: 0 }}>
+          No history yet. Log a few foods and your daily and weekly totals will appear here.
+        </p>
+      </div>
+    );
+  }
+  return (
+    <div>
+      {weeks.map((wk) => (
+        <div key={wk.monday} style={S.card}>
+          <div style={{ display: "flex", justifyContent: "space-between",
+            alignItems: "baseline", marginBottom: 10 }}>
+            <h3 style={{ fontFamily: "'Fraunces', serif", fontSize: 18, margin: 0, fontWeight: 600 }}>
+              {fmtRange(wk.monday)}
+            </h3>
+            <span style={{ fontSize: 11.5, color: C.muted }}>
+              {wk.days.length} day{wk.days.length > 1 ? "s" : ""}
+            </span>
+          </div>
+
+          {wk.days.map((day) => {
+            const isOpen = !!openDays[day.date];
+            return (
+              <div key={day.date} style={{ marginBottom: 8 }}>
+                <button
+                  onClick={() => toggleDay(day.date)}
+                  style={{ width: "100%", display: "flex",
+                    justifyContent: "space-between", alignItems: "baseline",
+                    padding: "6px 0", background: "none", border: "none",
+                    cursor: "pointer", textAlign: "left",
+                    fontFamily: "'Hanken Grotesk', sans-serif" }}
+                >
+                  <span style={{ fontWeight: 600, fontSize: 14, color: C.ink }}>
+                    <span style={{ display: "inline-block", width: 14,
+                      color: C.muted, fontSize: 11 }}>
+                      {isOpen ? "▾" : "▸"}
+                    </span>
+                    {fmtDay(day.date)}
+                    <span style={{ color: C.muted, fontWeight: 500,
+                      fontSize: 12, marginLeft: 6 }}>
+                      · {day.entries.length} item{day.entries.length > 1 ? "s" : ""}
+                    </span>
+                  </span>
+                  <span style={{ ...S.mono, fontSize: 13, color: C.clay }}>
+                    {day.totals.calories} kcal
+                  </span>
+                </button>
+                {isOpen && (
+                  <div style={{ paddingLeft: 2 }}>
+                    {day.entries.map((e) => (
+                      <EntryRow key={e.id} e={e} onDelete={deleteEntry} />
+                    ))}
+                    <div style={{ fontSize: 10, fontWeight: 700,
+                      letterSpacing: "0.05em", textTransform: "uppercase",
+                      color: C.sage, margin: "10px 0 6px" }}>
+                      Daily total{day.totals.grams > 0 ? ` · ≈ ${day.totals.grams} g` : ""}
+                    </div>
+                    <TotalsGrid totals={day.totals} accent="sage" />
+                  </div>
+                )}
+              </div>
+            );
+          })}
+
+          <div style={{ borderTop: `1px solid ${C.border}`, marginTop: 8, paddingTop: 11 }}>
+            <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: "0.06em",
+              textTransform: "uppercase", color: C.clay, marginBottom: 7 }}>
+              Weekly total{wk.totals.grams > 0 ? ` · ≈ ${wk.totals.grams} g` : ""}
+            </div>
+            <TotalsGrid totals={wk.totals} accent="clay" />
+          </div>
+
+          <FodmapBlock week={wk} reviews={reviews} setReview={setReview}
+            apiKey={apiKey} goSettings={goSettings} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* ============================================================
+   SETTINGS TAB
+   ============================================================ */
+function SettingsTab({ apiKey, setApiKey, entries, reviews, onClearAll,
+  syncUrl, setSyncUrl, syncStatus, lastSyncedAt, triggerSync }) {
+  const [draft, setDraft] = useState(apiKey || "");
+  const [show, setShow] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const [syncDraft, setSyncDraft] = useState(syncUrl || "");
+  const [editingSync, setEditingSync] = useState(!syncUrl);
+
+  useEffect(() => { setDraft(apiKey || ""); }, [apiKey]);
+  useEffect(() => { setSyncDraft(syncUrl || ""); setEditingSync(!syncUrl); }, [syncUrl]);
+
+  const onSave = () => {
+    setApiKey(draft.trim());
+    setSaved(true);
+    setTimeout(() => setSaved(false), 1800);
+  };
+  const onClear = () => {
+    setApiKey("");
+    setDraft("");
+  };
+
+  const entryCount = entries.length;
+  const reviewCount = Object.keys(reviews).length;
+
+  return (
+    <div>
+      <div style={S.card}>
+        <h3 style={{ fontFamily: "'Fraunces', serif", fontSize: 20, margin: "0 0 4px",
+          fontWeight: 600 }}>
+          Anthropic API key
+        </h3>
+        <p style={{ fontSize: 13, color: C.muted, margin: "0 0 12px", lineHeight: 1.5 }}>
+          Required for nutrition lookup and low-FODMAP reviews. Stored only on this device,
+          in localStorage. Each lookup costs roughly a tenth of a cent on Claude Haiku 4.5.
+        </p>
+
+        <label style={S.label}>API key</label>
+        <div style={{ position: "relative", marginBottom: 10 }}>
+          <input
+            style={{ ...S.input, paddingRight: 56,
+              fontFamily: "'Spline Sans Mono', monospace", fontSize: 13 }}
+            type={show ? "text" : "password"}
+            value={draft}
+            placeholder="sk-ant-…"
+            spellCheck={false}
+            autoCapitalize="off"
+            autoCorrect="off"
+            onChange={(e) => setDraft(e.target.value)}
+          />
+          <button
+            onClick={() => setShow((v) => !v)}
+            style={{ position: "absolute", right: 6, top: 6, padding: "5px 9px",
+              borderRadius: 7, border: "none", background: "transparent",
+              color: C.muted, fontSize: 11.5, fontWeight: 700, cursor: "pointer",
+              letterSpacing: "0.04em", textTransform: "uppercase" }}
+          >
+            {show ? "Hide" : "Show"}
+          </button>
+        </div>
+
+        <button className="lardr-btn" style={S.primaryBtn} onClick={onSave}>
+          {saved ? "Saved ✓" : "Save key"}
+        </button>
+
+        {apiKey && (
+          <button
+            className="lardr-btn"
+            style={{ ...S.ghostBtn, marginTop: 8 }}
+            onClick={onClear}
+          >
+            Remove key from this device
+          </button>
+        )}
+
+        <p style={{ fontSize: 11.5, color: C.muted, marginTop: 14, lineHeight: 1.55 }}>
+          Get a key at{" "}
+          <a
+            href="https://console.anthropic.com/settings/keys"
+            target="_blank"
+            rel="noreferrer"
+            style={{ color: C.clay, textDecoration: "underline" }}
+          >
+            console.anthropic.com
+          </a>
+          . You'll need to add a small amount of credit (a few dollars goes a long way).
+          The key stays on this device — it never leaves your browser except when calling
+          the Anthropic API.
+        </p>
+      </div>
+
+      {(() => {
+        const isSyncing = syncStatus.kind === "syncing";
+        const syncError = syncStatus.kind === "error" ? syncStatus.message : null;
+        const fmtRel = (ts) => {
+          if (!ts) return "never";
+          const diff = (Date.now() - ts) / 1000;
+          if (diff < 5) return "just now";
+          if (diff < 60) return Math.round(diff) + "s ago";
+          if (diff < 3600) return Math.round(diff / 60) + "m ago";
+          if (diff < 86400) return Math.round(diff / 3600) + "h ago";
+          return Math.round(diff / 86400) + "d ago";
+        };
+        const onSaveSync = () => {
+          const u = syncDraft.trim();
+          if (!u) return;
+          setSyncUrl(u);
+          setEditingSync(false);
+        };
+        return (
+          <div style={S.card}>
+            <h3 style={{ fontFamily: "'Fraunces', serif", fontSize: 20,
+              margin: "0 0 4px", fontWeight: 600 }}>
+              Sync to Google Sheets
+            </h3>
+            <p style={{ fontSize: 13, color: C.muted, margin: "0 0 12px",
+              lineHeight: 1.5 }}>
+              Optional. Keeps your log in a Google Sheet so multiple devices stay
+              in sync — and the sheet itself becomes your spreadsheet view. See the
+              README for the ~10-minute Apps Script setup.
+            </p>
+
+            {!editingSync && syncUrl && (
+              <>
+                <div style={{ display: "flex", alignItems: "center", gap: 10,
+                  marginBottom: 12, padding: "9px 11px",
+                  background: syncError ? C.clayBg : C.sageBg,
+                  borderRadius: 9 }}>
+                  <div style={{ width: 8, height: 8, borderRadius: "50%",
+                    background: isSyncing ? C.clay :
+                                syncError ? C.clayDark : C.sage }} />
+                  <div style={{ flex: 1, fontSize: 12.5, color: C.ink }}>
+                    {isSyncing ? "Syncing…" :
+                     syncError ? "Sync failed" :
+                     lastSyncedAt ? `Synced ${fmtRel(lastSyncedAt)}` :
+                     "Connected"}
+                  </div>
+                </div>
+
+                {syncError && (
+                  <div style={{ fontSize: 12, color: C.clayDark, marginBottom: 10,
+                    lineHeight: 1.45 }}>
+                    {syncError}
+                  </div>
+                )}
+
+                <button
+                  className="lardr-btn"
+                  style={{ ...S.primaryBtn, opacity: isSyncing ? 0.7 : 1 }}
+                  disabled={isSyncing}
+                  onClick={triggerSync}
+                >
+                  {isSyncing ? "Syncing…" : "Sync now"}
+                </button>
+
+                <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                  <button
+                    className="lardr-btn"
+                    style={{ ...S.ghostBtn, flex: 1 }}
+                    onClick={() => setEditingSync(true)}
+                  >
+                    Edit URL
+                  </button>
+                  <button
+                    className="lardr-btn"
+                    style={{ ...S.dangerBtn, flex: 1 }}
+                    onClick={() => setSyncUrl("")}
+                  >
+                    Disconnect
+                  </button>
+                </div>
+
+                <p style={{ fontSize: 10.5, color: C.faint, marginTop: 12,
+                  lineHeight: 1.5 }}>
+                  Disconnect stops sync on this device only; data on the Sheet
+                  and other devices is untouched.
+                </p>
+              </>
+            )}
+
+            {editingSync && (
+              <>
+                <label style={S.label}>Web App URL</label>
+                <input
+                  style={{ ...S.input,
+                    fontFamily: "'Spline Sans Mono', monospace", fontSize: 12 }}
+                  value={syncDraft}
+                  placeholder="https://script.google.com/macros/s/.../exec"
+                  spellCheck={false}
+                  autoCapitalize="off"
+                  autoCorrect="off"
+                  onChange={(e) => setSyncDraft(e.target.value)}
+                />
+                <p style={{ fontSize: 11, color: C.faint, margin: "6px 0 12px",
+                  lineHeight: 1.5 }}>
+                  This URL is the auth — treat it like a password, don't commit
+                  it anywhere public. On save, any entries on this device will
+                  upload to the Sheet.
+                </p>
+                <div style={{ display: "flex", gap: 8 }}>
+                  {syncUrl && (
+                    <button
+                      className="lardr-btn"
+                      style={{ ...S.ghostBtn, flex: 1 }}
+                      onClick={() => {
+                        setSyncDraft(syncUrl);
+                        setEditingSync(false);
+                      }}
+                    >
+                      Cancel
+                    </button>
+                  )}
+                  <button
+                    className="lardr-btn"
+                    style={{ ...S.primaryBtn, flex: syncUrl ? 1 : undefined,
+                      opacity: syncDraft.trim() ? 1 : 0.5 }}
+                    disabled={!syncDraft.trim()}
+                    onClick={onSaveSync}
+                  >
+                    {syncUrl ? "Save changes" : "Save & sync"}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        );
+      })()}
+
+      <div style={S.card}>
+        <h3 style={{ fontFamily: "'Fraunces', serif", fontSize: 20, margin: "0 0 4px",
+          fontWeight: 600 }}>
+          Your data
+        </h3>
+        <p style={{ fontSize: 13, color: C.muted, margin: "0 0 12px", lineHeight: 1.5 }}>
+          {entryCount} food {entryCount === 1 ? "entry" : "entries"} ·{" "}
+          {reviewCount} cached weekly review{reviewCount === 1 ? "" : "s"}. Everything
+          lives on this device — clearing browser storage will erase it.
+        </p>
+
+        {!confirming ? (
+          <button
+            className="lardr-btn"
+            style={S.dangerBtn}
+            onClick={() => setConfirming(true)}
+          >
+            Erase all entries &amp; reviews
+          </button>
+        ) : (
+          <div>
+            <p style={{ fontSize: 13, color: C.clayDark, margin: "0 0 9px" }}>
+              This deletes every food entry and every FODMAP review on this device.
+              Export a CSV first if you want a backup.
+            </p>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button
+                className="lardr-btn"
+                style={{ ...S.ghostBtn, flex: 1 }}
+                onClick={() => setConfirming(false)}
+              >
+                Cancel
+              </button>
+              <button
+                className="lardr-btn"
+                style={{ ...S.dangerBtn, flex: 1, background: C.clayDark, color: "#fff",
+                  borderColor: C.clayDark }}
+                onClick={() => { onClearAll(); setConfirming(false); }}
+              >
+                Yes, erase everything
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div style={{ ...S.card, background: "transparent", border: "none", boxShadow: "none",
+        textAlign: "center", padding: "4px 0 0" }}>
+        <div style={{ fontFamily: "'Fraunces', serif", fontSize: 14, color: C.muted,
+          fontStyle: "italic" }}>
+          Larder · low-FODMAP food tracker
+        </div>
+        <div style={{ fontSize: 10.5, color: C.faint, marginTop: 4 }}>
+          v1.1 · model: claude-haiku-4-5 · sync: Google Sheets
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   ROOT
+   ============================================================ */
+function App() {
+  const [tab, setTab] = useState("log");
+  const [entries, setEntries] = useState(() => {
+    const v = loadJSON(STORE, []);
+    return Array.isArray(v) ? v : [];
+  });
+  const [reviews, setReviews] = useState(() => {
+    const v = loadJSON(FODMAP_STORE, {});
+    return v && typeof v === "object" ? v : {};
+  });
+  const [apiKey, setApiKeyState] = useState(() => loadApiKey());
+  const [syncUrl, setSyncUrlState] = useState(() => loadSyncUrl());
+  const [syncStatus, setSyncStatus] = useState({ kind: "idle" });
+  const [lastSyncedAt, setLastSyncedAt] = useState(() =>
+    loadJSON(LAST_SYNC_STORE, null)
+  );
+
+  useEffect(() => { saveJSON(STORE, entries); }, [entries]);
+  useEffect(() => { saveJSON(FODMAP_STORE, reviews); }, [reviews]);
+
+  const setApiKey = useCallback((k) => {
+    saveApiKey(k);
+    setApiKeyState(k);
+  }, []);
+
+  const triggerSync = useCallback(async () => {
+    const url = loadSyncUrl();
+    if (!url) return;
+    setSyncStatus({ kind: "syncing" });
+    try {
+      const result = await performSync(url);
+      if (result && result.skipped) {
+        // Another sync is in flight; it will pick up any pending changes.
+        return;
+      }
+      if (result && result.entries) setEntries(result.entries);
+      const ts = Date.now();
+      setLastSyncedAt(ts);
+      setSyncStatus({ kind: "ok", at: ts });
+      // If new ops arrived during the sync, run another pass so nothing lingers.
+      const stillPending = loadJSON(PENDING_STORE, []);
+      if (stillPending.length > 0) {
+        setTimeout(() => triggerSync(), 250);
+      }
+    } catch (e) {
+      setSyncStatus({ kind: "error", message: String(e.message || e) });
+    }
+  }, []);
+
+  const setSyncUrl = useCallback(
+    async (url) => {
+      saveSyncUrl(url);
+      setSyncUrlState(url);
+      if (url) {
+        // Queue all local entries so first sync uploads them (prevents data loss)
+        const currentEntries = loadJSON(STORE, []);
+        for (const e of currentEntries) {
+          pushOp({
+            type: "upsert",
+            entry: { ...e, updatedAt: e.updatedAt || Date.now() },
+          });
+        }
+        await triggerSync();
+      } else {
+        setSyncStatus({ kind: "idle" });
+      }
+    },
+    [triggerSync]
+  );
+
+  const addEntry = (entry) => {
+    const e = { ...entry, updatedAt: Date.now() };
+    setEntries((prev) => [...prev, e]);
+    if (loadSyncUrl()) {
+      pushOp({ type: "upsert", entry: e });
+      triggerSync();
+    }
+  };
+
+  const deleteEntry = (id) => {
+    setEntries((prev) => prev.filter((e) => e.id !== id));
+    if (loadSyncUrl()) {
+      pushOp({ type: "delete", id });
+      triggerSync();
+    }
+  };
+
+  // Sync on mount and on tab refocus
+  useEffect(() => {
+    if (loadSyncUrl()) triggerSync();
+    const onVis = () => {
+      if (!document.hidden && loadSyncUrl()) triggerSync();
+    };
+    document.addEventListener("visibilitychange", onVis);
+    window.addEventListener("focus", onVis);
+    return () => {
+      document.removeEventListener("visibilitychange", onVis);
+      window.removeEventListener("focus", onVis);
+    };
+    // eslint-disable-next-line
+  }, []);
+
+  const setReview = useCallback((monday, review) => {
+    setReviews((prev) => ({ ...prev, [monday]: review }));
+  }, []);
+
+  const clearAll = () => {
+    setEntries([]);
+    setReviews({});
+    saveJSON(PENDING_STORE, []);
+  };
+
+  const exportCSV = () => {
+    if (entries.length === 0) return;
+    const csv = buildCSV(entries);
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `larder-food-log-${todayStr()}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  return (
+    <div className="lardr" style={S.shell}>
+      <style>{css}</style>
+      <div style={S.wrap}>
+        <header style={S.header}>
+          <h1 style={S.brand}>
+            Larder<span style={S.brandDot}>.</span>
+          </h1>
+          <div style={S.tagline}>low-FODMAP food &amp; nutrition tracker</div>
+        </header>
+
+        <div style={S.tabs}>
+          <button style={S.tab(tab === "log")} onClick={() => setTab("log")}>Log</button>
+          <button style={S.tab(tab === "history")} onClick={() => setTab("history")}>
+            History
+          </button>
+          <button style={S.tab(tab === "settings")} onClick={() => setTab("settings")}>
+            Settings
+          </button>
+        </div>
+
+        {tab === "log" && (
+          <LogTab
+            entries={entries}
+            apiKey={apiKey}
+            addEntry={addEntry}
+            deleteEntry={deleteEntry}
+            goSettings={() => setTab("settings")}
+          />
+        )}
+        {tab === "history" && (
+          <HistoryTab
+            entries={entries}
+            reviews={reviews}
+            setReview={setReview}
+            apiKey={apiKey}
+            goSettings={() => setTab("settings")}
+            deleteEntry={deleteEntry}
+          />
+        )}
+        {tab === "settings" && (
+          <SettingsTab
+            apiKey={apiKey}
+            setApiKey={setApiKey}
+            entries={entries}
+            reviews={reviews}
+            onClearAll={clearAll}
+            syncUrl={syncUrl}
+            setSyncUrl={setSyncUrl}
+            syncStatus={syncStatus}
+            lastSyncedAt={lastSyncedAt}
+            triggerSync={triggerSync}
+          />
+        )}
+
+        <button
+          className="lardr-btn"
+          style={{ ...S.ghostBtn, marginTop: 4, opacity: entries.length ? 1 : 0.45 }}
+          disabled={!entries.length}
+          onClick={exportCSV}
+        >
+          ⤓  Export CSV ({entries.length} entr{entries.length === 1 ? "y" : "ies"})
+        </button>
+        <p style={{ fontSize: 10.5, color: C.faint, textAlign: "center",
+          marginTop: 10, lineHeight: 1.5 }}>
+          Nutrition values and portion weights are AI estimates — check a product
+          label or scale for accuracy, especially Added Sugars. Data is saved on
+          this device.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
