@@ -172,7 +172,7 @@ async function callClaude(prompt, apiKey) {
 
 async function lookupNutrition(food, portion, apiKey) {
   const prompt =
-`You are a nutrition estimation tool. Estimate nutrition facts for the food and portion below. Double check that these totals are accurate.
+`You are a nutrition estimation tool. Estimate nutrition facts for the food and portion below.
 Food: ${food}
 Portion: ${portion || "1 standard serving"}
 
@@ -482,15 +482,54 @@ function TotalsGrid({ totals, accent }) {
   );
 }
 
-function EntryRow({ e, onDelete }) {
+function EntryRow({ e, onDelete, onUpdate }) {
   const [open, setOpen] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(null);
+
+  const startEdit = () => {
+    const d = {
+      foodName: e.foodName || "",
+      portionSize: e.portionSize || "",
+      grams: e.grams ? String(e.grams) : "",
+      date: e.date || todayStr(),
+      time: e.time || "",
+    };
+    for (const n of NUTRIENTS) d[n.key] = String(e[n.key] != null ? e[n.key] : 0);
+    setDraft(d);
+    setEditing(true);
+    setOpen(true);
+  };
+
+  const cancelEdit = () => {
+    setEditing(false);
+    setDraft(null);
+  };
+
+  const saveEdit = () => {
+    if (!draft || !draft.foodName.trim()) return;
+    const updated = {
+      ...e,
+      foodName: draft.foodName.trim(),
+      portionSize: draft.portionSize.trim(),
+      grams: Number(draft.grams) || 0,
+      date: draft.date,
+      time: draft.time,
+    };
+    for (const n of NUTRIENTS) updated[n.key] = Number(draft[n.key]) || 0;
+    onUpdate(updated);
+    setEditing(false);
+    setDraft(null);
+  };
+
   return (
     <div className="lardr-row" style={{ borderTop: `1px solid ${C.border}`, padding: "10px 0" }}>
       <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
         <button
-          onClick={() => setOpen((o) => !o)}
+          onClick={editing ? undefined : () => setOpen((o) => !o)}
           style={{ flex: 1, textAlign: "left", background: "none", border: "none",
-            cursor: "pointer", padding: 0, fontFamily: "'Hanken Grotesk', sans-serif" }}
+            cursor: editing ? "default" : "pointer", padding: 0,
+            fontFamily: "'Hanken Grotesk', sans-serif" }}
         >
           <div style={{ fontWeight: 600, fontSize: 15, color: C.ink }}>{e.foodName}</div>
           <div style={{ fontSize: 12.5, color: C.muted, marginTop: 1 }}>
@@ -509,17 +548,120 @@ function EntryRow({ e, onDelete }) {
           ×
         </button>
       </div>
-      {open && (
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)",
-          gap: 6, marginTop: 9 }}>
-          {NUTRIENTS.filter((n) => n.key !== "calories").map((n) => (
-            <div key={n.key} style={{ fontSize: 11, color: C.muted }}>
-              {n.label}{" "}
-              <span style={{ ...S.mono, color: C.ink, fontWeight: 600 }}>
-                {e[n.key]}{n.unit}
-              </span>
+
+      {open && !editing && (
+        <>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)",
+            gap: 6, marginTop: 9 }}>
+            {NUTRIENTS.filter((n) => n.key !== "calories").map((n) => (
+              <div key={n.key} style={{ fontSize: 11, color: C.muted }}>
+                {n.label}{" "}
+                <span style={{ ...S.mono, color: C.ink, fontWeight: 600 }}>
+                  {e[n.key]}{n.unit}
+                </span>
+              </div>
+            ))}
+          </div>
+          <button
+            className="lardr-btn"
+            onClick={startEdit}
+            style={{ marginTop: 10, padding: "7px 12px", borderRadius: 8,
+              border: `1px solid ${C.border}`, background: "transparent",
+              color: C.ink, fontWeight: 600, fontSize: 12, cursor: "pointer",
+              fontFamily: "'Hanken Grotesk', sans-serif",
+              display: "inline-flex", alignItems: "center", gap: 5 }}
+          >
+            <span style={{ fontSize: 10 }}>✎</span> Edit
+          </button>
+        </>
+      )}
+
+      {open && editing && draft && (
+        <div style={{ marginTop: 11, paddingTop: 11,
+          borderTop: `1px dashed ${C.border}` }}>
+          <label style={S.label}>Food name</label>
+          <input
+            style={S.input}
+            value={draft.foodName}
+            onChange={(ev) => setDraft((d) => ({ ...d, foodName: ev.target.value }))}
+          />
+
+          <div style={{ display: "flex", gap: 9, marginTop: 10 }}>
+            <div style={{ flex: 1.5 }}>
+              <label style={S.label}>Portion size</label>
+              <input
+                style={S.input}
+                value={draft.portionSize}
+                onChange={(ev) => setDraft((d) => ({ ...d, portionSize: ev.target.value }))}
+              />
             </div>
-          ))}
+            <div style={{ flex: 1 }}>
+              <label style={S.label}>Weight (g)</label>
+              <input
+                style={S.input}
+                inputMode="decimal"
+                value={draft.grams}
+                onChange={(ev) => setDraft((d) => ({ ...d, grams: ev.target.value }))}
+              />
+            </div>
+          </div>
+
+          <label style={{ ...S.label, marginTop: 11 }}>Nutrition facts</label>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)",
+            gap: 8, marginBottom: 11 }}>
+            {NUTRIENTS.map((n) => (
+              <div key={n.key}>
+                <div style={{ fontSize: 10, color: C.muted, marginBottom: 3 }}>
+                  {n.label} ({n.unit})
+                </div>
+                <input
+                  style={S.numInput}
+                  inputMode="decimal"
+                  value={draft[n.key]}
+                  onChange={(ev) =>
+                    setDraft((d) => ({ ...d, [n.key]: ev.target.value }))
+                  }
+                />
+              </div>
+            ))}
+          </div>
+
+          <div style={{ display: "flex", gap: 9, marginBottom: 12 }}>
+            <div style={{ flex: 1 }}>
+              <label style={S.label}>Date</label>
+              <input
+                type="date"
+                style={S.input}
+                value={draft.date}
+                onChange={(ev) => setDraft((d) => ({ ...d, date: ev.target.value }))}
+              />
+            </div>
+            <div style={{ flex: 1 }}>
+              <label style={S.label}>Time</label>
+              <input
+                type="time"
+                style={S.input}
+                value={draft.time}
+                onChange={(ev) => setDraft((d) => ({ ...d, time: ev.target.value }))}
+              />
+            </div>
+          </div>
+
+          <div style={{ display: "flex", gap: 8 }}>
+            <button className="lardr-btn" style={{ ...S.ghostBtn, flex: 1 }}
+              onClick={cancelEdit}>
+              Cancel
+            </button>
+            <button
+              className="lardr-btn"
+              style={{ ...S.primaryBtn, flex: 1,
+                opacity: draft.foodName.trim() ? 1 : 0.5 }}
+              disabled={!draft.foodName.trim()}
+              onClick={saveEdit}
+            >
+              Save changes
+            </button>
+          </div>
         </div>
       )}
     </div>
@@ -537,7 +679,7 @@ function apiErrorMessage(err) {
 /* ============================================================
    LOG TAB
    ============================================================ */
-function LogTab({ entries, apiKey, addEntry, deleteEntry, goSettings }) {
+function LogTab({ entries, apiKey, addEntry, deleteEntry, updateEntry, goSettings }) {
   const blank = NUTRIENTS.reduce((o, n) => ((o[n.key] = ""), o), {});
   const [food, setFood] = useState("");
   const [portion, setPortion] = useState("");
@@ -707,7 +849,7 @@ function LogTab({ entries, apiKey, addEntry, deleteEntry, goSettings }) {
           <>
             <div style={{ marginBottom: 12 }}>
               {todays.map((e) => (
-                <EntryRow key={e.id} e={e} onDelete={deleteEntry} />
+                <EntryRow key={e.id} e={e} onDelete={deleteEntry} onUpdate={updateEntry} />
               ))}
             </div>
             <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: "0.06em",
@@ -805,7 +947,7 @@ function FodmapBlock({ week, reviews, setReview, apiKey, goSettings }) {
   );
 }
 
-function HistoryTab({ entries, reviews, setReview, apiKey, goSettings, deleteEntry }) {
+function HistoryTab({ entries, reviews, setReview, apiKey, goSettings, deleteEntry, updateEntry }) {
   const weeks = useMemo(() => groupByWeek(entries), [entries]);
   const [openDays, setOpenDays] = useState(() => {
     const ws = groupByWeek(entries);
@@ -867,7 +1009,7 @@ function HistoryTab({ entries, reviews, setReview, apiKey, goSettings, deleteEnt
                 {isOpen && (
                   <div style={{ paddingLeft: 2 }}>
                     {day.entries.map((e) => (
-                      <EntryRow key={e.id} e={e} onDelete={deleteEntry} />
+                      <EntryRow key={e.id} e={e} onDelete={deleteEntry} onUpdate={updateEntry} />
                     ))}
                     <div style={{ fontSize: 10, fontWeight: 700,
                       letterSpacing: "0.05em", textTransform: "uppercase",
@@ -1181,7 +1323,7 @@ function SettingsTab({ apiKey, setApiKey, entries, reviews, onClearAll,
           Larder · low-FODMAP food tracker
         </div>
         <div style={{ fontSize: 10.5, color: C.faint, marginTop: 4 }}>
-          v1.1 · model: claude-haiku-4-5 · sync: Google Sheets
+          v1.2 · model: claude-haiku-4-5 · sync: Google Sheets
         </div>
       </div>
     </div>
@@ -1278,6 +1420,17 @@ function App() {
     }
   };
 
+  const updateEntry = (entry) => {
+    const updated = { ...entry, updatedAt: Date.now() };
+    setEntries((prev) =>
+      prev.map((e) => (e.id === updated.id ? updated : e))
+    );
+    if (loadSyncUrl()) {
+      pushOp({ type: "upsert", entry: updated });
+      triggerSync();
+    }
+  };
+
   // Sync on mount and on tab refocus
   useEffect(() => {
     if (loadSyncUrl()) triggerSync();
@@ -1344,6 +1497,7 @@ function App() {
             apiKey={apiKey}
             addEntry={addEntry}
             deleteEntry={deleteEntry}
+            updateEntry={updateEntry}
             goSettings={() => setTab("settings")}
           />
         )}
@@ -1355,6 +1509,7 @@ function App() {
             apiKey={apiKey}
             goSettings={() => setTab("settings")}
             deleteEntry={deleteEntry}
+            updateEntry={updateEntry}
           />
         )}
         {tab === "settings" && (
