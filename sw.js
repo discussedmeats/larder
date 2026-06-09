@@ -1,6 +1,6 @@
 /* Larder service worker — caches the app shell so it loads offline.
    API calls to api.anthropic.com always go to the network (never cached). */
-const CACHE = "larder-v1";
+const CACHE = "larder-v2-overwatch";
 const SHELL = [
   "./",
   "./index.html",
