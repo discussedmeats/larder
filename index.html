@@ -172,7 +172,7 @@ async function callClaude(prompt, apiKey) {
 
 async function lookupNutrition(food, portion, apiKey) {
   const prompt =
-`You are a nutrition estimation tool. Estimate nutrition facts for the food and portion below.
+`You are a nutrition estimation tool. Estimate nutrition facts for the food and portion below. Double check that these totals are accurate.
 Food: ${food}
 Portion: ${portion || "1 standard serving"}
 
