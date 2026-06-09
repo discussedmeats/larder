@@ -45,6 +45,7 @@ const { useState, useEffect, useMemo, useCallback } = React;
 
 const MODEL = "claude-haiku-4-5-20251001";
 const STORE = "larder-entries-v1";
+const SYMPTOMS_STORE = "larder-symptoms-v1";
 const FODMAP_STORE = "larder-fodmap-v1";
 const KEY_STORE = "larder-api-key";
 const SYNC_URL_STORE = "larder-sync-url";
@@ -244,19 +245,46 @@ function normalizeEntry(e) {
   return out;
 }
 
+function normalizeSymptom(s) {
+  const rawScore = s.score;
+  const parsedScore =
+    rawScore === "" || rawScore === null || rawScore === undefined
+      ? null
+      : Number(rawScore);
+  return {
+    id: String(s.id || ""),
+    date: String(s.date || ""),
+    time: String(s.time || ""),
+    score: Number.isFinite(parsedScore) ? parsedScore : null,
+    text: String(s.text || ""),
+    updatedAt: Number(s.updatedAt) || 0,
+  };
+}
+
+const scoreColor = (n) => {
+  if (n == null) return "#b6ab9b";
+  if (n <= 3) return "#bd5230";       // clay — worse
+  if (n <= 6) return "#c89a4a";       // amber — middle
+  return "#5f7150";                    // sage — better
+};
+
 function pushOp(op) {
+  const kind = op.kind || "food";
   const cur = loadJSON(PENDING_STORE, []);
+  const sameKind = (p) => (p.kind || "food") === kind;
   let next;
   if (op.type === "delete") {
-    // A later delete supersedes any pending upsert for the same id
-    next = cur.filter((p) => !(p.type === "upsert" && p.entry.id === op.id));
+    next = cur.filter(
+      (p) => !(sameKind(p) && p.type === "upsert" && p.entry && p.entry.id === op.id)
+    );
   } else if (op.type === "upsert") {
-    // Coalesce repeated upserts of the same id
-    next = cur.filter((p) => !(p.type === "upsert" && p.entry.id === op.entry.id));
+    next = cur.filter(
+      (p) => !(sameKind(p) && p.type === "upsert" && p.entry.id === op.entry.id)
+    );
   } else {
     next = [...cur];
   }
-  next.push(op);
+  next.push({ ...op, kind });
   saveJSON(PENDING_STORE, next);
 }
 
@@ -273,20 +301,23 @@ async function performSync(url) {
       const cur = loadJSON(PENDING_STORE, []);
       if (cur.length === 0) break;
       const op = cur[0];
+      const kind = op.kind || "food";
       if (op.type === "upsert") {
-        await gsPost(url, { action: "upsert", entry: op.entry });
+        await gsPost(url, { action: "upsert", kind, entry: op.entry });
       } else if (op.type === "delete") {
-        await gsPost(url, { action: "delete", id: op.id });
+        await gsPost(url, { action: "delete", kind, id: op.id });
       }
       const after = loadJSON(PENDING_STORE, []);
       saveJSON(PENDING_STORE, after.slice(1));
     }
-    // 2. Pull from sheet — sheet is the source of truth
-    const { entries: remote } = await gsGet(url);
-    const normalized = (remote || []).map(normalizeEntry);
-    saveJSON(STORE, normalized);
+    // 2. Pull both collections from the sheet — sheet is the source of truth
+    const data = await gsGet(url);
+    const entries = (data.entries || []).map(normalizeEntry);
+    const symptoms = (data.symptoms || []).map(normalizeSymptom);
+    saveJSON(STORE, entries);
+    saveJSON(SYMPTOMS_STORE, symptoms);
     saveJSON(LAST_SYNC_STORE, Date.now());
-    return { entries: normalized };
+    return { entries, symptoms };
   } finally {
     __syncInFlight = false;
   }
@@ -676,10 +707,192 @@ function apiErrorMessage(err) {
   return "Lookup failed — try again, or enter values manually.";
 }
 
+function ScoreScale({ value, onChange }) {
+  return (
+    <div style={{ display: "flex", gap: 3 }}>
+      {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((n) => {
+        const selected = value === n;
+        const color = scoreColor(n);
+        return (
+          <button
+            key={n}
+            type="button"
+            className="lardr-btn"
+            onClick={() => onChange(selected ? null : n)}
+            style={{
+              flex: 1, minWidth: 0, padding: "8px 0",
+              border: `1.5px solid ${selected ? color : C.border}`,
+              background: selected ? color : "#fff",
+              color: selected ? "#fff" : C.ink,
+              borderRadius: 7, fontWeight: 600, fontSize: 12.5,
+              cursor: "pointer",
+              fontFamily: "'Spline Sans Mono', monospace",
+            }}
+          >
+            {n}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function SymptomRow({ s, onDelete, onUpdate }) {
+  const [open, setOpen] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(null);
+
+  const startEdit = () => {
+    setDraft({
+      text: s.text || "",
+      score: s.score != null ? s.score : null,
+      date: s.date || todayStr(),
+      time: s.time || nowTime(),
+    });
+    setEditing(true);
+    setOpen(true);
+  };
+
+  const cancelEdit = () => {
+    setEditing(false);
+    setDraft(null);
+  };
+
+  const saveEdit = () => {
+    if (!draft) return;
+    if (!draft.text.trim() && draft.score == null) return;
+    onUpdate({
+      ...s,
+      text: draft.text.trim(),
+      score: draft.score,
+      date: draft.date,
+      time: draft.time,
+    });
+    setEditing(false);
+    setDraft(null);
+  };
+
+  const canSave = draft && (draft.text.trim() || draft.score != null);
+
+  return (
+    <div className="lardr-row" style={{ borderTop: `1px solid ${C.border}`, padding: "10px 0" }}>
+      <div style={{ display: "flex", alignItems: "flex-start", gap: 8 }}>
+        <button
+          onClick={editing ? undefined : () => setOpen((o) => !o)}
+          style={{ flex: 1, textAlign: "left", background: "none", border: "none",
+            cursor: editing ? "default" : "pointer", padding: 0,
+            fontFamily: "'Hanken Grotesk', sans-serif" }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 3 }}>
+            <span style={{ ...S.mono, fontSize: 12, color: C.muted }}>{s.time}</span>
+            {s.score != null && (
+              <span
+                style={{
+                  background: scoreColor(s.score), color: "#fff",
+                  fontSize: 11, fontWeight: 700, padding: "1px 7px",
+                  borderRadius: 9, fontFamily: "'Spline Sans Mono', monospace",
+                  letterSpacing: "0.02em",
+                }}
+              >
+                {s.score}/10
+              </span>
+            )}
+          </div>
+          <div
+            style={{
+              fontSize: 13.5, color: C.ink, lineHeight: 1.4,
+              whiteSpace: open ? "pre-wrap" : "nowrap",
+              overflow: "hidden", textOverflow: "ellipsis",
+            }}
+          >
+            {s.text || <span style={{ color: C.faint, fontStyle: "italic" }}>(no notes)</span>}
+          </div>
+        </button>
+        <button
+          onClick={() => onDelete(s.id)}
+          aria-label="delete"
+          style={{ border: "none", background: "none", cursor: "pointer",
+            color: C.faint, fontSize: 17, padding: "0 2px", lineHeight: 1 }}
+        >
+          ×
+        </button>
+      </div>
+
+      {open && !editing && (
+        <button
+          className="lardr-btn"
+          onClick={startEdit}
+          style={{ marginTop: 9, padding: "7px 12px", borderRadius: 8,
+            border: `1px solid ${C.border}`, background: "transparent",
+            color: C.ink, fontWeight: 600, fontSize: 12, cursor: "pointer",
+            fontFamily: "'Hanken Grotesk', sans-serif",
+            display: "inline-flex", alignItems: "center", gap: 5 }}
+        >
+          <span style={{ fontSize: 10 }}>✎</span> Edit
+        </button>
+      )}
+
+      {open && editing && draft && (
+        <div style={{ marginTop: 11, paddingTop: 11,
+          borderTop: `1px dashed ${C.border}` }}>
+          <label style={S.label}>Notes</label>
+          <textarea
+            style={{ ...S.input, minHeight: 70, resize: "vertical",
+              fontFamily: "'Hanken Grotesk', sans-serif",
+              padding: "9px 12px", lineHeight: 1.45 }}
+            value={draft.text}
+            placeholder="bloating after lunch, slept poorly, etc."
+            onChange={(ev) =>
+              setDraft((d) => ({ ...d, text: ev.target.value }))
+            }
+          />
+
+          <label style={{ ...S.label, marginTop: 11 }}>
+            Wellness (1 = worst, 10 = best, optional)
+          </label>
+          <ScoreScale
+            value={draft.score}
+            onChange={(n) => setDraft((d) => ({ ...d, score: n }))}
+          />
+
+          <div style={{ display: "flex", gap: 9, margin: "11px 0 12px" }}>
+            <div style={{ flex: 1 }}>
+              <label style={S.label}>Date</label>
+              <input type="date" style={S.input} value={draft.date}
+                onChange={(ev) => setDraft((d) => ({ ...d, date: ev.target.value }))} />
+            </div>
+            <div style={{ flex: 1 }}>
+              <label style={S.label}>Time</label>
+              <input type="time" style={S.input} value={draft.time}
+                onChange={(ev) => setDraft((d) => ({ ...d, time: ev.target.value }))} />
+            </div>
+          </div>
+
+          <div style={{ display: "flex", gap: 8 }}>
+            <button className="lardr-btn" style={{ ...S.ghostBtn, flex: 1 }}
+              onClick={cancelEdit}>
+              Cancel
+            </button>
+            <button
+              className="lardr-btn"
+              style={{ ...S.primaryBtn, flex: 1, opacity: canSave ? 1 : 0.5 }}
+              disabled={!canSave}
+              onClick={saveEdit}
+            >
+              Save changes
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ============================================================
    LOG TAB
    ============================================================ */
-function LogTab({ entries, apiKey, addEntry, deleteEntry, updateEntry, goSettings }) {
+function LogTab({ entries, symptoms, apiKey, addEntry, deleteEntry, updateEntry,
+  addSymptom, deleteSymptom, updateSymptom, goSettings }) {
   const blank = NUTRIENTS.reduce((o, n) => ((o[n.key] = ""), o), {});
   const [food, setFood] = useState("");
   const [portion, setPortion] = useState("");
@@ -696,6 +909,30 @@ function LogTab({ entries, apiKey, addEntry, deleteEntry, updateEntry, goSetting
     .filter((e) => e.date === today)
     .sort((a, b) => (a.time || "").localeCompare(b.time || ""));
   const todayTotals = useMemo(() => sumEntries(todays), [todays]);
+  const todaySymptoms = symptoms
+    .filter((s) => s.date === today)
+    .sort((a, b) => (a.time || "").localeCompare(b.time || ""));
+
+  // Symptom-note add form state
+  const [symText, setSymText] = useState("");
+  const [symScore, setSymScore] = useState(null);
+  const [symDate, setSymDate] = useState(todayStr());
+  const [symTime, setSymTime] = useState(nowTime());
+
+  const saveSymptom = () => {
+    if (!symText.trim() && symScore == null) return;
+    addSymptom({
+      id: Date.now() + "-" + Math.random().toString(36).slice(2, 7),
+      text: symText.trim(),
+      score: symScore,
+      date: symDate,
+      time: symTime,
+    });
+    setSymText(""); setSymScore(null);
+    setSymDate(todayStr()); setSymTime(nowTime());
+  };
+
+  const canSaveSym = symText.trim() || symScore != null;
 
   const doLookup = async () => {
     if (!food.trim()) { setErr("Enter a food name first."); return; }
@@ -833,6 +1070,53 @@ function LogTab({ entries, apiKey, addEntry, deleteEntry, updateEntry, goSetting
       </div>
 
       <div style={S.card}>
+        <h3 style={{ fontFamily: "'Fraunces', serif", fontSize: 19, margin: "0 0 3px",
+          fontWeight: 600 }}>
+          How are you feeling?
+        </h3>
+        <p style={{ fontSize: 12, color: C.muted, margin: "0 0 11px", lineHeight: 1.45 }}>
+          Log symptoms, reactions, energy, mood — any time. Score is optional.
+        </p>
+
+        <label style={S.label}>Notes</label>
+        <textarea
+          style={{ ...S.input, minHeight: 64, resize: "vertical",
+            fontFamily: "'Hanken Grotesk', sans-serif",
+            padding: "9px 12px", lineHeight: 1.45, marginBottom: 12 }}
+          value={symText}
+          placeholder="bloating after lunch, slept poorly, felt energetic, etc."
+          onChange={(ev) => setSymText(ev.target.value)}
+        />
+
+        <label style={S.label}>Wellness (1 = worst, 10 = best, optional)</label>
+        <div style={{ marginBottom: 12 }}>
+          <ScoreScale value={symScore} onChange={setSymScore} />
+        </div>
+
+        <div style={{ display: "flex", gap: 9, marginBottom: 13 }}>
+          <div style={{ flex: 1 }}>
+            <label style={S.label}>Date</label>
+            <input type="date" style={S.input} value={symDate}
+              onChange={(ev) => setSymDate(ev.target.value)} />
+          </div>
+          <div style={{ flex: 1 }}>
+            <label style={S.label}>Time</label>
+            <input type="time" style={S.input} value={symTime}
+              onChange={(ev) => setSymTime(ev.target.value)} />
+          </div>
+        </div>
+
+        <button
+          className="lardr-btn"
+          style={{ ...S.primaryBtn, opacity: canSaveSym ? 1 : 0.5 }}
+          disabled={!canSaveSym}
+          onClick={saveSymptom}
+        >
+          Add note
+        </button>
+      </div>
+
+      <div style={S.card}>
         <div style={{ display: "flex", justifyContent: "space-between",
           alignItems: "baseline", marginBottom: 4 }}>
           <h3 style={{ fontFamily: "'Fraunces', serif", fontSize: 19, margin: 0,
@@ -841,23 +1125,44 @@ function LogTab({ entries, apiKey, addEntry, deleteEntry, updateEntry, goSetting
           </h3>
           <span style={{ fontSize: 12, color: C.muted }}>{fmtDay(today)}</span>
         </div>
-        {todays.length === 0 ? (
+        {todays.length === 0 && todaySymptoms.length === 0 ? (
           <p style={{ fontSize: 13.5, color: C.muted, margin: "8px 0 2px" }}>
             Nothing logged yet today.
           </p>
         ) : (
           <>
-            <div style={{ marginBottom: 12 }}>
-              {todays.map((e) => (
-                <EntryRow key={e.id} e={e} onDelete={deleteEntry} onUpdate={updateEntry} />
-              ))}
-            </div>
-            <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: "0.06em",
-              textTransform: "uppercase", color: C.sage, marginBottom: 7 }}>
-              Daily total · {todays.length} item{todays.length > 1 ? "s" : ""}
-              {todayTotals.grams > 0 ? ` · ≈ ${todayTotals.grams} g` : ""}
-            </div>
-            <TotalsGrid totals={todayTotals} accent="sage" />
+            {todays.length > 0 && (
+              <>
+                <div style={{ marginBottom: 12 }}>
+                  {todays.map((e) => (
+                    <EntryRow key={e.id} e={e} onDelete={deleteEntry}
+                      onUpdate={updateEntry} />
+                  ))}
+                </div>
+                <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: "0.06em",
+                  textTransform: "uppercase", color: C.sage, marginBottom: 7 }}>
+                  Daily total · {todays.length} item{todays.length > 1 ? "s" : ""}
+                  {todayTotals.grams > 0 ? ` · ≈ ${todayTotals.grams} g` : ""}
+                </div>
+                <TotalsGrid totals={todayTotals} accent="sage" />
+              </>
+            )}
+            {todaySymptoms.length > 0 && (
+              <div style={{
+                marginTop: todays.length > 0 ? 16 : 0,
+                paddingTop: todays.length > 0 ? 14 : 0,
+                borderTop: todays.length > 0 ? `1px dashed ${C.border}` : "none",
+              }}>
+                <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: "0.06em",
+                  textTransform: "uppercase", color: C.clay, marginBottom: 4 }}>
+                  Today's notes · {todaySymptoms.length}
+                </div>
+                {todaySymptoms.map((s) => (
+                  <SymptomRow key={s.id} s={s} onDelete={deleteSymptom}
+                    onUpdate={updateSymptom} />
+                ))}
+              </div>
+            )}
           </>
         )}
       </div>
@@ -947,7 +1252,8 @@ function FodmapBlock({ week, reviews, setReview, apiKey, goSettings }) {
   );
 }
 
-function HistoryTab({ entries, reviews, setReview, apiKey, goSettings, deleteEntry, updateEntry }) {
+function HistoryTab({ entries, symptoms, reviews, setReview, apiKey, goSettings,
+  deleteEntry, updateEntry, deleteSymptom, updateSymptom }) {
   const weeks = useMemo(() => groupByWeek(entries), [entries]);
   const [openDays, setOpenDays] = useState(() => {
     const ws = groupByWeek(entries);
@@ -956,11 +1262,12 @@ function HistoryTab({ entries, reviews, setReview, apiKey, goSettings, deleteEnt
   });
   const toggleDay = (d) =>
     setOpenDays((o) => ({ ...o, [d]: !o[d] }));
-  if (entries.length === 0) {
+  if (entries.length === 0 && symptoms.length === 0) {
     return (
       <div style={S.card}>
         <p style={{ fontSize: 14, color: C.muted, margin: 0 }}>
-          No history yet. Log a few foods and your daily and weekly totals will appear here.
+          No history yet. Log foods or feelings and your daily and weekly summaries
+          will appear here.
         </p>
       </div>
     );
@@ -981,6 +1288,9 @@ function HistoryTab({ entries, reviews, setReview, apiKey, goSettings, deleteEnt
 
           {wk.days.map((day) => {
             const isOpen = !!openDays[day.date];
+            const daySymptoms = symptoms
+              .filter((s) => s.date === day.date)
+              .sort((a, b) => (a.time || "").localeCompare(b.time || ""));
             return (
               <div key={day.date} style={{ marginBottom: 8 }}>
                 <button
@@ -999,7 +1309,10 @@ function HistoryTab({ entries, reviews, setReview, apiKey, goSettings, deleteEnt
                     {fmtDay(day.date)}
                     <span style={{ color: C.muted, fontWeight: 500,
                       fontSize: 12, marginLeft: 6 }}>
-                      · {day.entries.length} item{day.entries.length > 1 ? "s" : ""}
+                      · {day.entries.length} item{day.entries.length === 1 ? "" : "s"}
+                      {daySymptoms.length > 0 && (
+                        <> · {daySymptoms.length} note{daySymptoms.length === 1 ? "" : "s"}</>
+                      )}
                     </span>
                   </span>
                   <span style={{ ...S.mono, fontSize: 13, color: C.clay }}>
@@ -1008,15 +1321,38 @@ function HistoryTab({ entries, reviews, setReview, apiKey, goSettings, deleteEnt
                 </button>
                 {isOpen && (
                   <div style={{ paddingLeft: 2 }}>
-                    {day.entries.map((e) => (
-                      <EntryRow key={e.id} e={e} onDelete={deleteEntry} onUpdate={updateEntry} />
-                    ))}
-                    <div style={{ fontSize: 10, fontWeight: 700,
-                      letterSpacing: "0.05em", textTransform: "uppercase",
-                      color: C.sage, margin: "10px 0 6px" }}>
-                      Daily total{day.totals.grams > 0 ? ` · ≈ ${day.totals.grams} g` : ""}
-                    </div>
-                    <TotalsGrid totals={day.totals} accent="sage" />
+                    {day.entries.length > 0 && (
+                      <>
+                        {day.entries.map((e) => (
+                          <EntryRow key={e.id} e={e} onDelete={deleteEntry}
+                            onUpdate={updateEntry} />
+                        ))}
+                        <div style={{ fontSize: 10, fontWeight: 700,
+                          letterSpacing: "0.05em", textTransform: "uppercase",
+                          color: C.sage, margin: "10px 0 6px" }}>
+                          Daily total{day.totals.grams > 0 ? ` · ≈ ${day.totals.grams} g` : ""}
+                        </div>
+                        <TotalsGrid totals={day.totals} accent="sage" />
+                      </>
+                    )}
+                    {daySymptoms.length > 0 && (
+                      <div style={{
+                        marginTop: day.entries.length > 0 ? 14 : 0,
+                        paddingTop: day.entries.length > 0 ? 12 : 0,
+                        borderTop: day.entries.length > 0
+                          ? `1px dashed ${C.border}` : "none",
+                      }}>
+                        <div style={{ fontSize: 10, fontWeight: 700,
+                          letterSpacing: "0.05em", textTransform: "uppercase",
+                          color: C.clay, marginBottom: 4 }}>
+                          Notes
+                        </div>
+                        {daySymptoms.map((s) => (
+                          <SymptomRow key={s.id} s={s} onDelete={deleteSymptom}
+                            onUpdate={updateSymptom} />
+                        ))}
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
@@ -1042,7 +1378,7 @@ function HistoryTab({ entries, reviews, setReview, apiKey, goSettings, deleteEnt
 /* ============================================================
    SETTINGS TAB
    ============================================================ */
-function SettingsTab({ apiKey, setApiKey, entries, reviews, onClearAll,
+function SettingsTab({ apiKey, setApiKey, entries, symptoms, reviews, onClearAll,
   syncUrl, setSyncUrl, syncStatus, lastSyncedAt, triggerSync }) {
   const [draft, setDraft] = useState(apiKey || "");
   const [show, setShow] = useState(false);
@@ -1065,6 +1401,7 @@ function SettingsTab({ apiKey, setApiKey, entries, reviews, onClearAll,
   };
 
   const entryCount = entries.length;
+  const symptomCount = symptoms.length;
   const reviewCount = Object.keys(reviews).length;
 
   return (
@@ -1277,6 +1614,7 @@ function SettingsTab({ apiKey, setApiKey, entries, reviews, onClearAll,
         </h3>
         <p style={{ fontSize: 13, color: C.muted, margin: "0 0 12px", lineHeight: 1.5 }}>
           {entryCount} food {entryCount === 1 ? "entry" : "entries"} ·{" "}
+          {symptomCount} note{symptomCount === 1 ? "" : "s"} ·{" "}
           {reviewCount} cached weekly review{reviewCount === 1 ? "" : "s"}. Everything
           lives on this device — clearing browser storage will erase it.
         </p>
@@ -1292,8 +1630,8 @@ function SettingsTab({ apiKey, setApiKey, entries, reviews, onClearAll,
         ) : (
           <div>
             <p style={{ fontSize: 13, color: C.clayDark, margin: "0 0 9px" }}>
-              This deletes every food entry and every FODMAP review on this device.
-              Export a CSV first if you want a backup.
+              This deletes every food entry, every note, and every FODMAP review
+              on this device. Export a CSV first if you want a backup.
             </p>
             <div style={{ display: "flex", gap: 8 }}>
               <button
@@ -1323,7 +1661,7 @@ function SettingsTab({ apiKey, setApiKey, entries, reviews, onClearAll,
           Larder · low-FODMAP food tracker
         </div>
         <div style={{ fontSize: 10.5, color: C.faint, marginTop: 4 }}>
-          v1.2 · model: claude-haiku-4-5 · sync: Google Sheets
+          v1.3 · model: claude-haiku-4-5 · sync: Google Sheets
         </div>
       </div>
     </div>
@@ -1339,6 +1677,10 @@ function App() {
     const v = loadJSON(STORE, []);
     return Array.isArray(v) ? v : [];
   });
+  const [symptoms, setSymptoms] = useState(() => {
+    const v = loadJSON(SYMPTOMS_STORE, []);
+    return Array.isArray(v) ? v : [];
+  });
   const [reviews, setReviews] = useState(() => {
     const v = loadJSON(FODMAP_STORE, {});
     return v && typeof v === "object" ? v : {};
@@ -1351,6 +1693,7 @@ function App() {
   );
 
   useEffect(() => { saveJSON(STORE, entries); }, [entries]);
+  useEffect(() => { saveJSON(SYMPTOMS_STORE, symptoms); }, [symptoms]);
   useEffect(() => { saveJSON(FODMAP_STORE, reviews); }, [reviews]);
 
   const setApiKey = useCallback((k) => {
@@ -1369,6 +1712,7 @@ function App() {
         return;
       }
       if (result && result.entries) setEntries(result.entries);
+      if (result && result.symptoms) setSymptoms(result.symptoms);
       const ts = Date.now();
       setLastSyncedAt(ts);
       setSyncStatus({ kind: "ok", at: ts });
@@ -1387,12 +1731,21 @@ function App() {
       saveSyncUrl(url);
       setSyncUrlState(url);
       if (url) {
-        // Queue all local entries so first sync uploads them (prevents data loss)
+        // Queue all local entries + symptoms so first sync uploads them
         const currentEntries = loadJSON(STORE, []);
         for (const e of currentEntries) {
           pushOp({
             type: "upsert",
+            kind: "food",
             entry: { ...e, updatedAt: e.updatedAt || Date.now() },
+          });
+        }
+        const currentSymptoms = loadJSON(SYMPTOMS_STORE, []);
+        for (const s of currentSymptoms) {
+          pushOp({
+            type: "upsert",
+            kind: "symptom",
+            entry: { ...s, updatedAt: s.updatedAt || Date.now() },
           });
         }
         await triggerSync();
@@ -1407,7 +1760,7 @@ function App() {
     const e = { ...entry, updatedAt: Date.now() };
     setEntries((prev) => [...prev, e]);
     if (loadSyncUrl()) {
-      pushOp({ type: "upsert", entry: e });
+      pushOp({ type: "upsert", kind: "food", entry: e });
       triggerSync();
     }
   };
@@ -1415,7 +1768,7 @@ function App() {
   const deleteEntry = (id) => {
     setEntries((prev) => prev.filter((e) => e.id !== id));
     if (loadSyncUrl()) {
-      pushOp({ type: "delete", id });
+      pushOp({ type: "delete", kind: "food", id });
       triggerSync();
     }
   };
@@ -1426,7 +1779,33 @@ function App() {
       prev.map((e) => (e.id === updated.id ? updated : e))
     );
     if (loadSyncUrl()) {
-      pushOp({ type: "upsert", entry: updated });
+      pushOp({ type: "upsert", kind: "food", entry: updated });
+      triggerSync();
+    }
+  };
+
+  const addSymptom = (s) => {
+    const sym = { ...s, updatedAt: Date.now() };
+    setSymptoms((prev) => [...prev, sym]);
+    if (loadSyncUrl()) {
+      pushOp({ type: "upsert", kind: "symptom", entry: sym });
+      triggerSync();
+    }
+  };
+
+  const deleteSymptom = (id) => {
+    setSymptoms((prev) => prev.filter((s) => s.id !== id));
+    if (loadSyncUrl()) {
+      pushOp({ type: "delete", kind: "symptom", id });
+      triggerSync();
+    }
+  };
+
+  const updateSymptom = (s) => {
+    const updated = { ...s, updatedAt: Date.now() };
+    setSymptoms((prev) => prev.map((x) => (x.id === updated.id ? updated : x)));
+    if (loadSyncUrl()) {
+      pushOp({ type: "upsert", kind: "symptom", entry: updated });
       triggerSync();
     }
   };
@@ -1452,6 +1831,7 @@ function App() {
 
   const clearAll = () => {
     setEntries([]);
+    setSymptoms([]);
     setReviews({});
     saveJSON(PENDING_STORE, []);
   };
@@ -1494,22 +1874,29 @@ function App() {
         {tab === "log" && (
           <LogTab
             entries={entries}
+            symptoms={symptoms}
             apiKey={apiKey}
             addEntry={addEntry}
             deleteEntry={deleteEntry}
             updateEntry={updateEntry}
+            addSymptom={addSymptom}
+            deleteSymptom={deleteSymptom}
+            updateSymptom={updateSymptom}
             goSettings={() => setTab("settings")}
           />
         )}
         {tab === "history" && (
           <HistoryTab
             entries={entries}
+            symptoms={symptoms}
             reviews={reviews}
             setReview={setReview}
             apiKey={apiKey}
             goSettings={() => setTab("settings")}
             deleteEntry={deleteEntry}
             updateEntry={updateEntry}
+            deleteSymptom={deleteSymptom}
+            updateSymptom={updateSymptom}
           />
         )}
         {tab === "settings" && (
@@ -1517,6 +1904,7 @@ function App() {
             apiKey={apiKey}
             setApiKey={setApiKey}
             entries={entries}
+            symptoms={symptoms}
             reviews={reviews}
             onClearAll={clearAll}
             syncUrl={syncUrl}
