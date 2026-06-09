@@ -144,6 +144,28 @@ function findWeeksToAutoReview(entries, symptoms, reviews) {
   return candidates.sort(); // chronological, oldest first
 }
 
+const MONTH_NAMES = ["", "January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December"];
+const monthLabel = (year, month) => `${MONTH_NAMES[month]} ${year}`;
+
+function buildMonthGrid(year, month) {
+  // month is 1-based. Returns 42 cells (6 weeks × 7 days), Monday-anchored.
+  const firstDay = new Date(year, month - 1, 1);
+  const dow = firstDay.getDay(); // 0 = Sunday
+  const daysBack = (dow + 6) % 7; // Mon-based: Mon -> 0, Sun -> 6
+
+  const cells = [];
+  for (let i = 0; i < 42; i++) {
+    const d = new Date(year, month - 1, 1 - daysBack + i);
+    cells.push({
+      date: `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`,
+      dayNum: d.getDate(),
+      isCurrentMonth: d.getMonth() + 1 === month && d.getFullYear() === year,
+    });
+  }
+  return cells;
+}
+
 /* ---------- storage helpers (sync localStorage) ---------- */
 const loadJSON = (k, fb) => {
   try { const v = localStorage.getItem(k); return v != null ? JSON.parse(v) : fb; }
@@ -1372,26 +1394,144 @@ function FodmapBlock({ week, weekSymptoms, reviews, setReview, apiKey, goSetting
   );
 }
 
-function HistoryTab({ entries, symptoms, reviews, setReview, apiKey, goSettings,
+function WeekSummaryCard({ wk, weekSymptoms, reviews, setReview, apiKey, goSettings, defaultOpen }) {
+  const [open, setOpen] = useState(!!defaultOpen);
+  const foodCount = wk.days.reduce((n, d) => n + d.entries.length, 0);
+  const noteCount = weekSymptoms.length;
+  return (
+    <div style={S.card}>
+      <button
+        onClick={() => setOpen((o) => !o)}
+        style={{ width: "100%", display: "flex",
+          justifyContent: "space-between", alignItems: "baseline",
+          padding: 0, background: "none", border: "none",
+          cursor: "pointer", textAlign: "left",
+          fontFamily: "'Hanken Grotesk', sans-serif" }}
+      >
+        <span>
+          <span style={{ display: "inline-block", width: 14, color: C.muted,
+            fontSize: 11 }}>{open ? "▾" : "▸"}</span>
+          <span style={{ fontFamily: "'Fraunces', serif", fontSize: 17,
+            fontWeight: 600, color: C.ink }}>
+            {fmtRange(wk.monday)}
+          </span>
+        </span>
+        <span style={{ fontSize: 11.5, color: C.muted }}>
+          {foodCount} food{foodCount === 1 ? "" : "s"} · {noteCount} note{noteCount === 1 ? "" : "s"}
+        </span>
+      </button>
+
+      {open && (
+        <div style={{ marginTop: 12 }}>
+          {foodCount > 0 && (
+            <div style={{ marginBottom: 10 }}>
+              <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: "0.06em",
+                textTransform: "uppercase", color: C.clay, marginBottom: 7 }}>
+                Weekly total{wk.totals.grams > 0 ? ` · ≈ ${wk.totals.grams} g` : ""}
+              </div>
+              <TotalsGrid totals={wk.totals} accent="clay" />
+            </div>
+          )}
+          <FodmapBlock week={wk} weekSymptoms={weekSymptoms} reviews={reviews}
+            setReview={setReview} apiKey={apiKey} goSettings={goSettings} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CalendarTab({ entries, symptoms, reviews, setReview, apiKey, goSettings,
   deleteEntry, updateEntry, deleteSymptom, updateSymptom, autoReviewing }) {
-  const weeks = useMemo(() => groupByWeek(entries), [entries]);
-  const [openDays, setOpenDays] = useState(() => {
-    const ws = groupByWeek(entries);
-    if (ws.length && ws[0].days.length) return { [ws[0].days[0].date]: true };
-    return {};
-  });
-  const toggleDay = (d) =>
-    setOpenDays((o) => ({ ...o, [d]: !o[d] }));
-  if (entries.length === 0 && symptoms.length === 0) {
-    return (
-      <div style={S.card}>
-        <p style={{ fontSize: 14, color: C.muted, margin: 0 }}>
-          No history yet. Log foods or feelings and your daily and weekly summaries
-          will appear here.
-        </p>
-      </div>
-    );
-  }
+  const today = todayStr();
+  const [viewMonth, setViewMonth] = useState(() => today.slice(0, 7));
+  const [selectedDate, setSelectedDate] = useState(today);
+
+  const [y, m] = viewMonth.split("-").map(Number);
+  const grid = useMemo(() => buildMonthGrid(y, m), [viewMonth]);
+
+  // Index entries and symptoms by date
+  const byDate = useMemo(() => {
+    const out = {};
+    for (const e of entries) {
+      if (!e.date) continue;
+      if (!out[e.date]) out[e.date] = { foods: [], symptoms: [], calories: 0 };
+      out[e.date].foods.push(e);
+      out[e.date].calories += Number(e.calories) || 0;
+    }
+    for (const s of symptoms) {
+      if (!s.date) continue;
+      if (!out[s.date]) out[s.date] = { foods: [], symptoms: [], calories: 0 };
+      out[s.date].symptoms.push(s);
+    }
+    for (const d of Object.values(out)) {
+      d.foods.sort((a, b) => (a.time || "").localeCompare(b.time || ""));
+      d.symptoms.sort((a, b) => (a.time || "").localeCompare(b.time || ""));
+    }
+    return out;
+  }, [entries, symptoms]);
+
+  // Weeks that touch the visible month (oldest mondays last)
+  const monthWeeks = useMemo(() => {
+    const mondaySet = new Set();
+    for (const cell of grid) {
+      if (cell.isCurrentMonth) mondaySet.add(mondayOf(cell.date));
+    }
+    const mondays = Array.from(mondaySet).sort().reverse();
+    return mondays.map((monday) => {
+      const days = [];
+      for (let i = 0; i < 7; i++) {
+        const date = addDays(monday, i);
+        const dayEntries = byDate[date] ? byDate[date].foods : [];
+        days.push({ date, entries: dayEntries, totals: sumEntries(dayEntries) });
+      }
+      const wsyms = [];
+      for (let i = 0; i < 7; i++) {
+        const date = addDays(monday, i);
+        if (byDate[date]) wsyms.push(...byDate[date].symptoms);
+      }
+      wsyms.sort((a, b) => {
+        if (a.date !== b.date) return a.date.localeCompare(b.date);
+        return (a.time || "").localeCompare(b.time || "");
+      });
+      const totals = sumEntries(days.flatMap((d) => d.entries));
+      return { monday, days, totals, weekSymptoms: wsyms };
+    });
+  }, [grid, byDate]);
+
+  // Selected day's content
+  const selected = byDate[selectedDate] || { foods: [], symptoms: [], calories: 0 };
+  const selectedTotals = useMemo(() => sumEntries(selected.foods), [selected.foods]);
+
+  const prevMonth = () => {
+    const newM = m === 1 ? 12 : m - 1;
+    const newY = m === 1 ? y - 1 : y;
+    setViewMonth(`${newY}-${pad(newM)}`);
+  };
+  const nextMonth = () => {
+    const newM = m === 12 ? 1 : m + 1;
+    const newY = m === 12 ? y + 1 : y;
+    setViewMonth(`${newY}-${pad(newM)}`);
+  };
+  const goToday = () => {
+    setViewMonth(today.slice(0, 7));
+    setSelectedDate(today);
+  };
+  const onDayClick = (cell) => {
+    setSelectedDate(cell.date);
+    if (!cell.isCurrentMonth) setViewMonth(cell.date.slice(0, 7));
+  };
+
+  const isCurrentMonthView = viewMonth === today.slice(0, 7);
+  const arrowBtn = {
+    background: "none", border: "none", cursor: "pointer",
+    color: C.ink, fontSize: 24, padding: "4px 12px", lineHeight: 1,
+    fontFamily: "'Fraunces', serif",
+  };
+  const dayNameStyle = {
+    textAlign: "center", fontSize: 10, fontWeight: 700,
+    letterSpacing: "0.06em", color: C.muted, padding: "5px 0",
+  };
+
   return (
     <div>
       {autoReviewing && (
@@ -1404,120 +1544,177 @@ function HistoryTab({ entries, symptoms, reviews, setReview, apiKey, goSettings,
           <span>Generating weekly review…</span>
         </div>
       )}
-      {weeks.map((wk) => {
-        const weekStart = wk.monday;
-        const weekEnd = addDays(wk.monday, 6);
-        const weekSymptoms = symptoms
-          .filter((s) => s.date >= weekStart && s.date <= weekEnd)
-          .sort((a, b) => {
-            if (a.date !== b.date) return a.date.localeCompare(b.date);
-            return (a.time || "").localeCompare(b.time || "");
-          });
-        return (
-        <div key={wk.monday} style={S.card}>
-          <div style={{ display: "flex", justifyContent: "space-between",
-            alignItems: "baseline", marginBottom: 10 }}>
-            <h3 style={{ fontFamily: "'Fraunces', serif", fontSize: 18, margin: 0, fontWeight: 600 }}>
-              {fmtRange(wk.monday)}
-            </h3>
-            <span style={{ fontSize: 11.5, color: C.muted }}>
-              {wk.days.length} day{wk.days.length > 1 ? "s" : ""}
-            </span>
-          </div>
 
-          {wk.days.map((day) => {
-            const isOpen = !!openDays[day.date];
-            const daySymptoms = symptoms
-              .filter((s) => s.date === day.date)
-              .sort((a, b) => (a.time || "").localeCompare(b.time || ""));
+      <div style={S.card}>
+        <div style={{ display: "flex", alignItems: "center",
+          justifyContent: "space-between", marginBottom: 10 }}>
+          <button onClick={prevMonth} style={arrowBtn} aria-label="previous month">‹</button>
+          <h2 style={{ fontFamily: "'Fraunces', serif", fontSize: 20, margin: 0,
+            fontWeight: 600, textAlign: "center", flex: 1 }}>
+            {monthLabel(y, m)}
+          </h2>
+          <button onClick={nextMonth} style={arrowBtn} aria-label="next month">›</button>
+        </div>
+
+        {!isCurrentMonthView && (
+          <button
+            onClick={goToday}
+            style={{ display: "block", margin: "0 auto 12px",
+              background: "transparent", border: `1px solid ${C.border}`,
+              borderRadius: 999, padding: "5px 14px", cursor: "pointer",
+              fontSize: 11.5, fontWeight: 600, color: C.muted,
+              fontFamily: "'Hanken Grotesk', sans-serif" }}
+          >
+            Jump to today
+          </button>
+        )}
+
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)",
+          gap: 4, marginBottom: 5 }}>
+          {["M", "T", "W", "T", "F", "S", "S"].map((label, i) => (
+            <div key={i} style={dayNameStyle}>{label}</div>
+          ))}
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 4 }}>
+          {grid.map((cell) => {
+            const data = byDate[cell.date];
+            const hasFood = data && data.foods.length > 0;
+            const hasNote = data && data.symptoms.length > 0;
+            const isToday = cell.date === today;
+            const isSelected = cell.date === selectedDate;
+            const cellBg = isSelected ? C.clay
+              : isToday ? "#fffbf0"
+              : cell.isCurrentMonth ? "#fff"
+              : "transparent";
+            const cellBorder = isSelected ? `1.5px solid ${C.clay}`
+              : isToday ? `1.5px solid ${C.clay}`
+              : cell.isCurrentMonth ? `1px solid ${C.border}`
+              : `1px solid transparent`;
+            const cellColor = isSelected ? "#fff"
+              : cell.isCurrentMonth ? C.ink
+              : C.faint;
+            const dotColor = isSelected ? "rgba(255,255,255,0.95)" : null;
             return (
-              <div key={day.date} style={{ marginBottom: 8 }}>
-                <button
-                  onClick={() => toggleDay(day.date)}
-                  style={{ width: "100%", display: "flex",
-                    justifyContent: "space-between", alignItems: "baseline",
-                    padding: "6px 0", background: "none", border: "none",
-                    cursor: "pointer", textAlign: "left",
-                    fontFamily: "'Hanken Grotesk', sans-serif" }}
-                >
-                  <span style={{ fontWeight: 600, fontSize: 14, color: C.ink }}>
-                    <span style={{ display: "inline-block", width: 14,
-                      color: C.muted, fontSize: 11 }}>
-                      {isOpen ? "▾" : "▸"}
-                    </span>
-                    {fmtDay(day.date)}
-                    <span style={{ color: C.muted, fontWeight: 500,
-                      fontSize: 12, marginLeft: 6 }}>
-                      · {day.entries.length} item{day.entries.length === 1 ? "" : "s"}
-                      {daySymptoms.length > 0 && (
-                        <> · {daySymptoms.length} note{daySymptoms.length === 1 ? "" : "s"}</>
-                      )}
-                    </span>
-                  </span>
-                  <span style={{ ...S.mono, fontSize: 13, color: C.clay }}>
-                    {day.totals.calories} kcal
-                  </span>
-                </button>
-                {isOpen && (
-                  <div style={{ paddingLeft: 2 }}>
-                    {day.entries.length > 0 && (
-                      <>
-                        {day.entries.map((e) => (
-                          <EntryRow key={e.id} e={e} onDelete={deleteEntry}
-                            onUpdate={updateEntry} />
-                        ))}
-                        <div style={{ fontSize: 10, fontWeight: 700,
-                          letterSpacing: "0.05em", textTransform: "uppercase",
-                          color: C.sage, margin: "10px 0 6px" }}>
-                          Daily total{day.totals.grams > 0 ? ` · ≈ ${day.totals.grams} g` : ""}
-                        </div>
-                        <TotalsGrid totals={day.totals} accent="sage" />
-                      </>
-                    )}
-                    {daySymptoms.length > 0 && (
-                      <div style={{
-                        marginTop: day.entries.length > 0 ? 14 : 0,
-                        paddingTop: day.entries.length > 0 ? 12 : 0,
-                        borderTop: day.entries.length > 0
-                          ? `1px dashed ${C.border}` : "none",
-                      }}>
-                        <div style={{ fontSize: 10, fontWeight: 700,
-                          letterSpacing: "0.05em", textTransform: "uppercase",
-                          color: C.clay, marginBottom: 4 }}>
-                          Notes
-                        </div>
-                        {daySymptoms.map((s) => (
-                          <SymptomRow key={s.id} s={s} onDelete={deleteSymptom}
-                            onUpdate={updateSymptom} />
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                )}
-              </div>
+              <button
+                key={cell.date}
+                onClick={() => onDayClick(cell)}
+                style={{
+                  background: cellBg,
+                  border: cellBorder,
+                  color: cellColor,
+                  borderRadius: 8,
+                  padding: "4px 2px",
+                  minHeight: 54,
+                  display: "flex",
+                  flexDirection: "column",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  cursor: "pointer",
+                  fontFamily: "'Hanken Grotesk', sans-serif",
+                }}
+              >
+                <div style={{ fontSize: 14,
+                  fontWeight: isToday || isSelected ? 700 : 500 }}>
+                  {cell.dayNum}
+                </div>
+                <div style={{ display: "flex", gap: 3, height: 5,
+                  alignItems: "center" }}>
+                  {hasFood && (
+                    <div style={{ width: 4.5, height: 4.5, borderRadius: "50%",
+                      background: dotColor || C.clay }} />
+                  )}
+                  {hasNote && (
+                    <div style={{ width: 4.5, height: 4.5, borderRadius: "50%",
+                      background: dotColor || C.sage }} />
+                  )}
+                </div>
+                <div style={{ fontSize: 8.5,
+                  fontFamily: "'Spline Sans Mono', monospace",
+                  color: isSelected ? "rgba(255,255,255,0.85)" : C.muted,
+                  minHeight: 11, fontWeight: 600 }}>
+                  {data && data.calories > 0 ? Math.round(data.calories) : ""}
+                </div>
+              </button>
             );
           })}
-
-          <div style={{ borderTop: `1px solid ${C.border}`, marginTop: 8, paddingTop: 11 }}>
-            <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: "0.06em",
-              textTransform: "uppercase", color: C.clay, marginBottom: 7 }}>
-              Weekly total{wk.totals.grams > 0 ? ` · ≈ ${wk.totals.grams} g` : ""}
-            </div>
-            <TotalsGrid totals={wk.totals} accent="clay" />
-          </div>
-
-          <FodmapBlock week={wk} weekSymptoms={weekSymptoms} reviews={reviews}
-            setReview={setReview} apiKey={apiKey} goSettings={goSettings} />
         </div>
-        );
-      })}
+      </div>
+
+      <div style={S.card}>
+        <div style={{ display: "flex", justifyContent: "space-between",
+          alignItems: "baseline", marginBottom: 8 }}>
+          <h3 style={{ fontFamily: "'Fraunces', serif", fontSize: 18,
+            margin: 0, fontWeight: 600 }}>
+            {fmtDay(selectedDate)}
+          </h3>
+          {selected.foods.length > 0 && (
+            <span style={{ ...S.mono, fontSize: 13, color: C.clay }}>
+              {Math.round(selectedTotals.calories)} kcal
+            </span>
+          )}
+        </div>
+        {selected.foods.length === 0 && selected.symptoms.length === 0 ? (
+          <p style={{ fontSize: 13, color: C.muted, margin: "6px 0 2px" }}>
+            Nothing logged this day.
+          </p>
+        ) : (
+          <>
+            {selected.foods.length > 0 && (
+              <>
+                {selected.foods.map((e) => (
+                  <EntryRow key={e.id} e={e} onDelete={deleteEntry}
+                    onUpdate={updateEntry} />
+                ))}
+                <div style={{ fontSize: 10, fontWeight: 700,
+                  letterSpacing: "0.05em", textTransform: "uppercase",
+                  color: C.sage, margin: "11px 0 6px" }}>
+                  Daily total · {selected.foods.length} item{selected.foods.length === 1 ? "" : "s"}
+                  {selectedTotals.grams > 0 ? ` · ≈ ${selectedTotals.grams} g` : ""}
+                </div>
+                <TotalsGrid totals={selectedTotals} accent="sage" />
+              </>
+            )}
+            {selected.symptoms.length > 0 && (
+              <div style={{
+                marginTop: selected.foods.length > 0 ? 14 : 0,
+                paddingTop: selected.foods.length > 0 ? 12 : 0,
+                borderTop: selected.foods.length > 0
+                  ? `1px dashed ${C.border}` : "none",
+              }}>
+                <div style={{ fontSize: 10, fontWeight: 700,
+                  letterSpacing: "0.05em", textTransform: "uppercase",
+                  color: C.clay, marginBottom: 4 }}>
+                  Notes
+                </div>
+                {selected.symptoms.map((s) => (
+                  <SymptomRow key={s.id} s={s} onDelete={deleteSymptom}
+                    onUpdate={updateSymptom} />
+                ))}
+              </div>
+            )}
+          </>
+        )}
+      </div>
+
+      {monthWeeks
+        .filter((w) => w.days.some((d) => d.entries.length) || w.weekSymptoms.length)
+        .map((wk, i) => (
+          <WeekSummaryCard
+            key={wk.monday}
+            wk={wk}
+            weekSymptoms={wk.weekSymptoms}
+            reviews={reviews}
+            setReview={setReview}
+            apiKey={apiKey}
+            goSettings={goSettings}
+            defaultOpen={i === 0}
+          />
+        ))}
     </div>
   );
 }
 
-/* ============================================================
-   SETTINGS TAB
-   ============================================================ */
 function SettingsTab({ apiKey, setApiKey, entries, symptoms, reviews, onClearAll,
   syncUrl, setSyncUrl, syncStatus, lastSyncedAt, triggerSync,
   autoReview, setAutoReview }) {
@@ -1835,7 +2032,7 @@ function SettingsTab({ apiKey, setApiKey, entries, symptoms, reviews, onClearAll
           Larder · low-FODMAP food tracker
         </div>
         <div style={{ fontSize: 10.5, color: C.faint, marginTop: 4 }}>
-          v1.5 · model: claude-haiku-4-5 · sync: Google Sheets
+          v1.6 · model: claude-haiku-4-5 · sync: Google Sheets
         </div>
       </div>
     </div>
@@ -2112,8 +2309,8 @@ function App() {
 
         <div style={S.tabs}>
           <button style={S.tab(tab === "log")} onClick={() => setTab("log")}>Log</button>
-          <button style={S.tab(tab === "history")} onClick={() => setTab("history")}>
-            History
+          <button style={S.tab(tab === "calendar")} onClick={() => setTab("calendar")}>
+            Calendar
           </button>
           <button style={S.tab(tab === "settings")} onClick={() => setTab("settings")}>
             Settings
@@ -2134,8 +2331,8 @@ function App() {
             goSettings={() => setTab("settings")}
           />
         )}
-        {tab === "history" && (
-          <HistoryTab
+        {tab === "calendar" && (
+          <CalendarTab
             entries={entries}
             symptoms={symptoms}
             reviews={reviews}
