@@ -1717,7 +1717,7 @@ function CalendarTab({ entries, symptoms, reviews, setReview, apiKey, goSettings
 
 function SettingsTab({ apiKey, setApiKey, entries, symptoms, reviews, onClearAll,
   syncUrl, setSyncUrl, syncStatus, lastSyncedAt, triggerSync,
-  autoReview, setAutoReview }) {
+  autoReview, setAutoReview, onExportCSV }) {
   const [draft, setDraft] = useState(apiKey || "");
   const [show, setShow] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -1990,6 +1990,16 @@ function SettingsTab({ apiKey, setApiKey, entries, symptoms, reviews, onClearAll
           lives on this device — clearing browser storage will erase it.
         </p>
 
+        <button
+          className="lardr-btn"
+          style={{ ...S.ghostBtn, marginBottom: 9,
+            opacity: entryCount ? 1 : 0.45 }}
+          disabled={!entryCount}
+          onClick={onExportCSV}
+        >
+          ⤓  Export food log to CSV ({entryCount} entr{entryCount === 1 ? "y" : "ies"})
+        </button>
+
         {!confirming ? (
           <button
             className="lardr-btn"
@@ -2032,7 +2042,7 @@ function SettingsTab({ apiKey, setApiKey, entries, symptoms, reviews, onClearAll
           Larder · low-FODMAP food tracker
         </div>
         <div style={{ fontSize: 10.5, color: C.faint, marginTop: 4 }}>
-          v1.6 · model: claude-haiku-4-5 · sync: Google Sheets
+          v1.7 · model: claude-haiku-4-5 · sync: Google Sheets
         </div>
       </div>
     </div>
@@ -2361,19 +2371,12 @@ function App() {
             triggerSync={triggerSync}
             autoReview={autoReview}
             setAutoReview={setAutoReview}
+            onExportCSV={exportCSV}
           />
         )}
 
-        <button
-          className="lardr-btn"
-          style={{ ...S.ghostBtn, marginTop: 4, opacity: entries.length ? 1 : 0.45 }}
-          disabled={!entries.length}
-          onClick={exportCSV}
-        >
-          ⤓  Export CSV ({entries.length} entr{entries.length === 1 ? "y" : "ies"})
-        </button>
         <p style={{ fontSize: 10.5, color: C.faint, textAlign: "center",
-          marginTop: 10, lineHeight: 1.5 }}>
+          marginTop: 14, lineHeight: 1.5 }}>
           Nutrition values and portion weights are AI estimates — check a product
           label or scale for accuracy, especially Added Sugars. Data is saved on
           this device.
