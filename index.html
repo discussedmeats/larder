@@ -108,6 +108,12 @@ const fmtRange = (mon) => {
   return `${M[+m1]} ${+d1} – ${M[+m2]} ${+d2}, ${y2}`;
 };
 
+const DOW = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const fmtDow = (dateStr) => {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  return DOW[new Date(y, m - 1, d).getDay()];
+};
+
 /* ---------- storage helpers (sync localStorage) ---------- */
 const loadJSON = (k, fb) => {
   try { const v = localStorage.getItem(k); return v != null ? JSON.parse(v) : fb; }
@@ -191,19 +197,34 @@ Round every value to one decimal place.`;
   return out;
 }
 
-async function fodmapReview(foodList, apiKey) {
+async function fodmapReview(foodLines, symptomLines, apiKey) {
   const prompt =
-`A person is tracking food for a low-FODMAP diet (commonly used to manage IBS symptoms). Here are the foods eaten over one week:
-${foodList.map((f) => "- " + f).join("\n")}
+`A person is tracking food and how they feel as part of a low-FODMAP approach (commonly used to manage IBS, SIBO, lactose intolerance, and fructose malabsorption symptoms). Below is one week of their data, in chronological order.
 
-Using standard low-FODMAP references (e.g. Monash University guidance), respond with ONLY a JSON object — no markdown:
+FOODS EATEN:
+${foodLines.length ? foodLines.join("\n") : "(none logged this week)"}
+
+SYMPTOMS / FEELINGS LOGGED (wellness 1-10, where 10 is best, may be absent):
+${symptomLines.length ? symptomLines.join("\n") : "(none logged this week)"}
+
+Using Monash University low-FODMAP guidance and standard dietary patterns relevant to IBS / SIBO / lactose intolerance / fructose malabsorption, respond with ONLY a JSON object — no markdown:
+
 {
- "alignment": "2-3 sentence overall assessment of how well this week fits a low-FODMAP diet",
- "highFodmap": ["food — short reason it is high-FODMAP", "..."],
+ "weekSummary": "2-3 sentence overall observation about the week, naming any clear patterns",
+ "patterns": ["specific food-symptom timing observations, e.g. 'discomfort logged 15:00 Tue followed 12:30 lunch with onion'", "..."],
+ "highFodmapEaten": ["specific food eaten — why it's high-FODMAP — any reactions logged in the hours after", "..."],
  "lowFodmapGood": ["low-FODMAP-friendly choices already present", "..."],
- "completeness": ["specific, actionable suggestions to improve nutritional completeness using low-FODMAP foods", "..."]
+ "experiments": ["specific actionable swap to test next week, e.g. 'replace garlic with garlic-infused oil and re-check bloating'", "..."],
+ "completeness": ["nutritional gap visible in the week — and a low-FODMAP food that fills it", "..."]
 }
-Keep highFodmap, lowFodmapGood and completeness to 3-5 concise items each. This is general educational information, not medical advice.`;
+
+Constraints:
+- Only flag patterns supported by what's in the data. One symptom alone is not a pattern.
+- Be specific about days, times, and food names. Names and timestamps beat generalities.
+- For each high-FODMAP item, note any reactions logged within several hours after if present.
+- "experiments" must be specific swaps the person can do this week, not general advice.
+- Each array: 3-6 items. Return [] for any array where there's nothing substantive.
+- This is pattern observation, not medical diagnosis. A registered low-FODMAP dietitian is the right resource for actual elimination protocols.`;
   const data = await callClaude(prompt, apiKey);
   return extractJSON(data);
 }
@@ -1173,18 +1194,34 @@ function LogTab({ entries, symptoms, apiKey, addEntry, deleteEntry, updateEntry,
 /* ============================================================
    HISTORY TAB
    ============================================================ */
-function FodmapBlock({ week, reviews, setReview, apiKey, goSettings }) {
+function FodmapBlock({ week, weekSymptoms, reviews, setReview, apiKey, goSettings }) {
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState("");
   const review = reviews[week.monday];
 
+  // Compute local stats from the actual data (not LLM output)
+  const foodCount = week.days.reduce((n, d) => n + d.entries.length, 0);
+  const noteCount = weekSymptoms.length;
+  const scored = weekSymptoms.filter((s) => s.score != null);
+  const avgScore = scored.length
+    ? Math.round((scored.reduce((a, s) => a + s.score, 0) / scored.length) * 10) / 10
+    : null;
+
   const run = async () => {
     setErr(""); setLoading(true);
     try {
-      const foods = week.days.flatMap((d) =>
-        d.entries.map((e) => `${e.foodName}${e.portionSize ? ` (${e.portionSize})` : ""}`)
+      const foodLines = week.days.flatMap((d) =>
+        d.entries.map((e) =>
+          `${fmtDow(e.date)} ${e.date} ${e.time} — ${e.foodName}` +
+          (e.portionSize ? ` (${e.portionSize})` : "")
+        )
       );
-      const r = await fodmapReview(foods, apiKey);
+      const symptomLines = weekSymptoms.map((s) => {
+        const scoreBit = s.score != null ? `wellness ${s.score}/10` : "no score";
+        const text = s.text || "(no notes)";
+        return `${fmtDow(s.date)} ${s.date} ${s.time} — ${scoreBit} — ${text}`;
+      });
+      const r = await fodmapReview(foodLines, symptomLines, apiKey);
       setReview(week.monday, r);
     } catch (e) {
       setErr(apiErrorMessage(e));
@@ -1193,12 +1230,54 @@ function FodmapBlock({ week, reviews, setReview, apiKey, goSettings }) {
     }
   };
 
+  // Build the section list, mapping old-shape reviews to new fields gracefully
+  const sections = review ? [
+    { t: "Patterns worth watching", d: review.patterns, c: C.clay },
+    { t: "Higher-FODMAP items eaten", d: review.highFodmapEaten || review.highFodmap, c: C.clayDark },
+    { t: "Good low-FODMAP choices", d: review.lowFodmapGood, c: C.sage },
+    { t: "Experiments to try next week", d: review.experiments, c: C.ink },
+    { t: "For more complete nutrition", d: review.completeness, c: C.muted },
+  ] : [];
+
   return (
     <div style={{ marginTop: 12, borderTop: `1px dashed ${C.border}`, paddingTop: 12 }}>
+      {/* Wellness summary (always shown when there's data) */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)",
+        gap: 6, marginBottom: 11 }}>
+        <div style={{ background: C.sageBg, borderRadius: 9, padding: "7px 9px" }}>
+          <div style={{ fontSize: 9.5, fontWeight: 700, letterSpacing: "0.05em",
+            textTransform: "uppercase", color: C.muted }}>Foods</div>
+          <div style={{ ...S.mono, fontSize: 15, fontWeight: 600, marginTop: 2 }}>
+            {foodCount}
+          </div>
+        </div>
+        <div style={{ background: C.clayBg, borderRadius: 9, padding: "7px 9px" }}>
+          <div style={{ fontSize: 9.5, fontWeight: 700, letterSpacing: "0.05em",
+            textTransform: "uppercase", color: C.muted }}>Notes</div>
+          <div style={{ ...S.mono, fontSize: 15, fontWeight: 600, marginTop: 2 }}>
+            {noteCount}
+          </div>
+        </div>
+        <div style={{
+          background: avgScore != null ? "#f3eed8" : "#f0eadc",
+          borderRadius: 9, padding: "7px 9px" }}>
+          <div style={{ fontSize: 9.5, fontWeight: 700, letterSpacing: "0.05em",
+            textTransform: "uppercase", color: C.muted }}>Avg wellness</div>
+          <div style={{ ...S.mono, fontSize: 15, fontWeight: 600, marginTop: 2,
+            color: avgScore != null ? scoreColor(Math.round(avgScore)) : C.faint }}>
+            {avgScore != null ? `${avgScore}` : "—"}
+            {avgScore != null && (
+              <span style={{ fontSize: 9.5, color: C.muted, marginLeft: 2 }}>/10</span>
+            )}
+          </div>
+        </div>
+      </div>
+
       <div style={{ fontSize: 11, fontWeight: 700, letterSpacing: "0.06em",
         textTransform: "uppercase", color: C.clay, marginBottom: 8 }}>
         Low-FODMAP review
       </div>
+
       {!review && (
         <button
           className="lardr-btn"
@@ -1206,32 +1285,32 @@ function FodmapBlock({ week, reviews, setReview, apiKey, goSettings }) {
           disabled={loading || !apiKey}
           onClick={apiKey ? run : goSettings}
         >
-          {loading ? "Reviewing the week…" : apiKey ? "Generate low-FODMAP review" : "Set API key in Settings to enable"}
+          {loading ? "Reviewing the week…"
+            : apiKey ? "Generate low-FODMAP review"
+            : "Set API key in Settings to enable"}
         </button>
       )}
       {err && <div style={{ fontSize: 12.5, color: C.clayDark, marginTop: 8 }}>{err}</div>}
+
       {review && (
         <div style={{ fontSize: 13.5, lineHeight: 1.5 }}>
-          <p style={{ margin: "0 0 10px" }}>{review.alignment}</p>
-          {[
-            { t: "Higher-FODMAP items to watch", d: review.highFodmap, c: C.clayDark },
-            { t: "Good low-FODMAP choices", d: review.lowFodmapGood, c: C.sage },
-            { t: "For more complete nutrition", d: review.completeness, c: C.ink },
-          ].map(
-            (sec) =>
-              Array.isArray(sec.d) &&
-              sec.d.length > 0 && (
-                <div key={sec.t} style={{ marginBottom: 9 }}>
-                  <div style={{ fontWeight: 700, fontSize: 12, color: sec.c, marginBottom: 3 }}>
-                    {sec.t}
-                  </div>
-                  <ul style={{ margin: 0, paddingLeft: 17 }}>
-                    {sec.d.map((x, i) => (
-                      <li key={i} style={{ marginBottom: 2 }}>{x}</li>
-                    ))}
-                  </ul>
+          <p style={{ margin: "0 0 10px" }}>
+            {review.weekSummary || review.alignment}
+          </p>
+          {sections.map((sec) =>
+            Array.isArray(sec.d) && sec.d.length > 0 ? (
+              <div key={sec.t} style={{ marginBottom: 10 }}>
+                <div style={{ fontWeight: 700, fontSize: 12, color: sec.c,
+                  marginBottom: 3 }}>
+                  {sec.t}
                 </div>
-              )
+                <ul style={{ margin: 0, paddingLeft: 17 }}>
+                  {sec.d.map((x, i) => (
+                    <li key={i} style={{ marginBottom: 3 }}>{x}</li>
+                  ))}
+                </ul>
+              </div>
+            ) : null
           )}
           <button
             onClick={run}
@@ -1243,8 +1322,10 @@ function FodmapBlock({ week, reviews, setReview, apiKey, goSettings }) {
             {loading ? "refreshing…" : "refresh review"}
           </button>
           <p style={{ fontSize: 10.5, color: C.faint, marginTop: 8, marginBottom: 0 }}>
-            General educational information, not medical advice. The Monash University
-            FODMAP app is the most accurate reference for specific foods.
+            Pattern observation, not medical advice. The Monash University FODMAP
+            app is the most accurate reference for specific foods, and a registered
+            low-FODMAP dietitian is the right resource for actual elimination
+            protocols.
           </p>
         </div>
       )}
@@ -1274,7 +1355,16 @@ function HistoryTab({ entries, symptoms, reviews, setReview, apiKey, goSettings,
   }
   return (
     <div>
-      {weeks.map((wk) => (
+      {weeks.map((wk) => {
+        const weekStart = wk.monday;
+        const weekEnd = addDays(wk.monday, 6);
+        const weekSymptoms = symptoms
+          .filter((s) => s.date >= weekStart && s.date <= weekEnd)
+          .sort((a, b) => {
+            if (a.date !== b.date) return a.date.localeCompare(b.date);
+            return (a.time || "").localeCompare(b.time || "");
+          });
+        return (
         <div key={wk.monday} style={S.card}>
           <div style={{ display: "flex", justifyContent: "space-between",
             alignItems: "baseline", marginBottom: 10 }}>
@@ -1367,10 +1457,11 @@ function HistoryTab({ entries, symptoms, reviews, setReview, apiKey, goSettings,
             <TotalsGrid totals={wk.totals} accent="clay" />
           </div>
 
-          <FodmapBlock week={wk} reviews={reviews} setReview={setReview}
-            apiKey={apiKey} goSettings={goSettings} />
+          <FodmapBlock week={wk} weekSymptoms={weekSymptoms} reviews={reviews}
+            setReview={setReview} apiKey={apiKey} goSettings={goSettings} />
         </div>
-      ))}
+        );
+      })}
     </div>
   );
 }
@@ -1661,7 +1752,7 @@ function SettingsTab({ apiKey, setApiKey, entries, symptoms, reviews, onClearAll
           Larder · low-FODMAP food tracker
         </div>
         <div style={{ fontSize: 10.5, color: C.faint, marginTop: 4 }}>
-          v1.3 · model: claude-haiku-4-5 · sync: Google Sheets
+          v1.4 · model: claude-haiku-4-5 · sync: Google Sheets
         </div>
       </div>
     </div>
