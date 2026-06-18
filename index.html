@@ -438,6 +438,39 @@ function groupByWeek(entries) {
   });
 }
 
+// Build a single Monday→Sunday week object (same shape monthWeeks produces),
+// pulling every food entry and symptom whose date falls in that 7-day window.
+function buildWeek(entries, symptoms, monday) {
+  const byDate = {};
+  for (const e of entries) {
+    if (!e.date) continue;
+    (byDate[e.date] = byDate[e.date] || { foods: [], symptoms: [] }).foods.push(e);
+  }
+  for (const s of symptoms) {
+    if (!s.date) continue;
+    (byDate[s.date] = byDate[s.date] || { foods: [], symptoms: [] }).symptoms.push(s);
+  }
+  const days = [];
+  for (let i = 0; i < 7; i++) {
+    const date = addDays(monday, i);
+    const dayEntries = (byDate[date] ? byDate[date].foods : [])
+      .slice()
+      .sort((a, b) => (a.time || "").localeCompare(b.time || ""));
+    days.push({ date, entries: dayEntries, totals: sumEntries(dayEntries) });
+  }
+  const weekSymptoms = [];
+  for (let i = 0; i < 7; i++) {
+    const date = addDays(monday, i);
+    if (byDate[date]) weekSymptoms.push(...byDate[date].symptoms);
+  }
+  weekSymptoms.sort((a, b) => {
+    if (a.date !== b.date) return a.date.localeCompare(b.date);
+    return (a.time || "").localeCompare(b.time || "");
+  });
+  const totals = sumEntries(days.flatMap((d) => d.entries));
+  return { monday, days, totals, weekSymptoms };
+}
+
 /* ---------- CSV ---------- */
 const csvCell = (v) => {
   const s = String(v ?? "");
@@ -986,7 +1019,7 @@ function SymptomRow({ s, onDelete, onUpdate }) {
    LOG TAB
    ============================================================ */
 function LogTab({ entries, symptoms, apiKey, addEntry, deleteEntry, updateEntry,
-  addSymptom, deleteSymptom, updateSymptom, goSettings }) {
+  addSymptom, deleteSymptom, updateSymptom, goSettings, reviews, setReview }) {
   const blank = NUTRIENTS.reduce((o, n) => ((o[n.key] = ""), o), {});
   const [food, setFood] = useState("");
   const [portion, setPortion] = useState("");
@@ -1006,6 +1039,15 @@ function LogTab({ entries, symptoms, apiKey, addEntry, deleteEntry, updateEntry,
   const todaySymptoms = symptoms
     .filter((s) => s.date === today)
     .sort((a, b) => (a.time || "").localeCompare(b.time || ""));
+
+  // Weekly-review week selector (defaults to the current Monday-anchored week).
+  const thisMonday = mondayOf(today);
+  const [reviewMonday, setReviewMonday] = useState(thisMonday);
+  const reviewWeek = useMemo(
+    () => buildWeek(entries, symptoms, reviewMonday),
+    [entries, symptoms, reviewMonday]
+  );
+  const atCurrentWeek = reviewMonday >= thisMonday;
 
   // Symptom-note add form state
   const [symText, setSymText] = useState("");
@@ -1259,6 +1301,46 @@ function LogTab({ entries, symptoms, apiKey, addEntry, deleteEntry, updateEntry,
             )}
           </>
         )}
+      </div>
+
+      <div style={S.card}>
+        <div style={{ display: "flex", justifyContent: "space-between",
+          alignItems: "center", marginBottom: 4 }}>
+          <button
+            onClick={() => setReviewMonday((mon) => addDays(mon, -7))}
+            aria-label="previous week"
+            style={{ background: "none", border: "none", cursor: "pointer",
+              color: C.ink, fontSize: 22, padding: "2px 10px", lineHeight: 1,
+              fontFamily: "'Bebas Neue', sans-serif" }}
+          >‹</button>
+          <div style={{ textAlign: "center" }}>
+            <h3 style={{ fontFamily: "'Bebas Neue', sans-serif", fontSize: 19,
+              margin: 0, fontWeight: 600 }}>
+              Weekly review
+            </h3>
+            <div style={{ fontSize: 11.5, color: C.muted, marginTop: 1 }}>
+              {fmtRange(reviewMonday)}{atCurrentWeek ? " · in progress" : ""}
+            </div>
+          </div>
+          <button
+            onClick={() => setReviewMonday((mon) => addDays(mon, 7))}
+            disabled={atCurrentWeek}
+            aria-label="next week"
+            style={{ background: "none", border: "none",
+              cursor: atCurrentWeek ? "default" : "pointer",
+              color: atCurrentWeek ? C.faint : C.ink, fontSize: 22,
+              padding: "2px 10px", lineHeight: 1,
+              fontFamily: "'Bebas Neue', sans-serif" }}
+          >›</button>
+        </div>
+        <FodmapBlock
+          week={reviewWeek}
+          weekSymptoms={reviewWeek.weekSymptoms}
+          reviews={reviews}
+          setReview={setReview}
+          apiKey={apiKey}
+          goSettings={goSettings}
+        />
       </div>
     </div>
   );
@@ -2363,6 +2445,8 @@ function App() {
             deleteSymptom={deleteSymptom}
             updateSymptom={updateSymptom}
             goSettings={() => setTab("settings")}
+            reviews={reviews}
+            setReview={setReview}
           />
         )}
         {tab === "calendar" && (
